@@ -1,3 +1,3 @@
-# Ruiyu Zhang Website
+# Qihao Wang Website
 
-This repository contains the source for [Ruiyu Zhang's academic website](https://ryzhanghason.github.io/).
+This repository contains the source for [Qihao Wang's academic website](https://qhwangantoneva.github.io/).

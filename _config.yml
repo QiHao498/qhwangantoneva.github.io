@@ -7,48 +7,48 @@
 # server process.
 
 # Basic Site Settings
-locale                   : "en-US"
-title                    : "Ruiyu Zhang 张瑞瑜"
+locale                   : "zh-CN"
+title                    : "Qihao Wang 王麒昊"
 title_separator          : "-"
-name                     : &name "Ruiyu ZHANG"
-description              : &description "personal description"
-url                      : https://ryzhanghason.github.io # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
+name                     : &name "Qihao WANG"
+description              : &description "Personal website of Qihao Wang"
+url                      : https://qhwangantoneva.github.io # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
 baseurl                  : "" # the subpath of your site, e.g. "/blog"
-repository               : "ryzhanghason/ryzhanghason.github.io"
+repository               : "qhwangantoneva/qhwangantoneva.github.io"
 
 # Site Author - The following control what appear as part of the author content on the side bar.
 #               If a field is blank the icon and link will not appear, otherwise it will be shown.
 #               Additional customization can be done by editing /_includes/author-profile.html
 author:
   # Biographic information
-  avatar           : "New_Photo_1223.png"
-  name             : "Ruiyu ZHANG"
-  pronouns         : # example: "she/her"  
-  bio              : 
-  location         : "Hong Kong"
-  employer         : 
+  avatar           : "profile.png"
+  name             : "Qihao WANG"
+  pronouns         : # example: "she/her"
+  bio              :
+  location         : "" # e.g. "Hong Kong"
+  employer         :
   uri              : # URL
-  email            : "ruiyuzh@connect.hku.hk" 
+  email            : "" # your-email@example.com
 
   # Academic websites
   arxiv            : # URL - Update with the correct link to your profile
-  googlescholar    : "https://scholar.google.com/citations?user=lDbRBUkAAAAJ&hl=en&inst=17644838422235682599"
+  googlescholar    : # URL
   impactstory      : # URL
-  orcid            : "https://orcid.org/0000-0002-0883-4574" 
-  pubmed           :  
-  researchgate     : "https://www.researchgate.net/profile/Ruiyu-Zhang-9?ev=hdr_xprf"
-  huggingface      : "https://huggingface.co/RyZhangHason"
+  orcid            : # URL
+  pubmed           :
+  researchgate     : # URL
+  huggingface      : # URL
 
   # Repositories and software development
-  bitbucket        : # Username - Update with your username on the site
+  bitbucket        : # Username
   codepen          : # Username
   dribbble         : # Username
-  github           : "ryZhangHason"
-  kaggle           : # Username  
-  stackoverflow    : # User number or user number and name (i.e., use "1" or "1/jeff-atwood")    
+  github           : "qhwangantoneva"
+  kaggle           : # Username
+  stackoverflow    : # User number or user number and name
 
   # Social media
-  bluesky          :  
+  bluesky          :
   facebook         : # Username
   flickr           : # Username
   foursquare       : # Username
@@ -139,7 +139,7 @@ social:
 analytics:
   provider               :  "google-analytics-4" # false (default), "google", "google-universal", "google-analytics-4", "custom"
   google:
-    tracking_id          : "G-8YDZWX15RL"
+    tracking_id          : ""
 
 
 # Reading Files
@@ -283,7 +283,7 @@ sass:
 permalink: /:categories/:title/
 # paginate: 5 # amount of posts to show
 # paginate_path: /page:num/
-timezone: America/Los_Angeles # http://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+timezone: Asia/Shanghai # http://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
 
 # Plugins
