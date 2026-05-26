@@ -35,6 +35,8 @@ const STATE = {
     currentFile: null,         // {name, size} of uploaded file
     modelHistory: [],          // [{name, spec, result}] for multi-model comparison
     scatterCharts: {},         // {varName: chartSpec} cached scatter charts
+    filterEnabled: false,      // Whether a data filter is active
+    filterConditions: null,    // {col, type, min, max, values} filter spec
 };
 
 // =========================================================================
@@ -55,35 +57,54 @@ document.addEventListener('DOMContentLoaded', () => {
 // =========================================================================
 
 async function initPyodide() {
+    const progressContainer = document.getElementById('pyodide-progress-container');
     const statusEl = document.getElementById('pyodide-status');
+
+    // Helper to update progress bar and text
+    function updatePyodideProgress(percent, statusText) {
+        const fill = document.getElementById('pyodide-progress-fill');
+        const text = document.getElementById('pyodide-progress-text');
+        if (fill) fill.style.width = percent + '%';
+        if (text) text.textContent = statusText;
+    }
+
     try {
-        statusEl.textContent = 'Pyodide: Loading...';
-        statusEl.className = 'status-badge loading';
+        // Stage 1: Downloading Pyodide core (0-40%)
+        updatePyodideProgress(5, 'Downloading Pyodide core...');
 
         const pyodide = await loadPyodide({
             indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/',
         });
 
-        statusEl.textContent = 'Pyodide: Installing packages...';
+        updatePyodideProgress(40, 'Pyodide core loaded. Installing packages...');
 
-        // Load required Python packages
-        await pyodide.loadPackage(['numpy', 'pandas', 'statsmodels', 'scipy']);
-        // openpyxl not available in Pyodide — Excel export falls back to CSV
+        // Stage 2: Installing packages (40-70%)
+        await pyodide.loadPackage(['numpy', 'pandas', 'statsmodels', 'scipy', 'openpyxl']);
 
-        // Load our bridge module
+        updatePyodideProgress(70, 'Packages installed. Importing modules...');
+
+        // Stage 3: Loading bridge module (70-95%)
         const bridgeCode = await fetch('py/bridge.py').then(r => r.text());
         pyodide.runPython(bridgeCode);
 
+        updatePyodideProgress(95, 'Bridge loaded. Finalizing...');
+
+        // Stage 4: Ready (95-100%)
         STATE.pyodide = pyodide;
         STATE.pyodideReady = true;
-        statusEl.textContent = 'Pyodide: Ready';
-        statusEl.className = 'status-badge ready';
+
+        updatePyodideProgress(100, 'Ready');
+        progressContainer.classList.add('ready');
+        statusEl.classList.remove('hidden');
 
         console.log('[Pyodide] Ready with numpy, pandas, statsmodels, scipy, openpyxl');
     } catch (err) {
         console.error('[Pyodide] Failed to initialize:', err);
+        updatePyodideProgress(0, 'Error loading Pyodide');
         statusEl.textContent = 'Pyodide: Error';
         statusEl.className = 'status-badge error';
+        statusEl.classList.remove('hidden');
+        progressContainer.classList.add('hidden');
         showError('data-error', 'Failed to load Python runtime (Pyodide). Please check your internet connection and reload the page.');
     }
 }
@@ -128,10 +149,10 @@ function initTabs() {
 }
 
 function resizeAllCharts() {
-    const chartIds = ['chart-residual-fitted', 'chart-qq', 'chart-scale-location', 'chart-cooks'];
-    chartIds.forEach(id => {
-        const el = document.getElementById(id);
-        if (el && el._fullLayout) Plotly.Plots.resize(el);
+    // Query all Plotly chart containers in the DOM (avoids hardcoded list going stale)
+    const chartContainers = document.querySelectorAll('.chart-container[id]');
+    chartContainers.forEach(el => {
+        if (el._fullLayout) Plotly.Plots.resize(el);
     });
 }
 
@@ -389,8 +410,9 @@ function populateVariableSelectors() {
     const dvSelect = document.getElementById('dep-var-select');
     dvSelect.innerHTML = '<option value="">-- Select dependent variable --</option>';
     columns.forEach(c => {
-        // Suggest numeric columns for DV
-        if (c.col_type === 'numeric') {
+        // Suggest numeric columns for DV, plus categorical columns with exactly 2 unique values
+        // (string-encoded binary variables like "Yes"/"No", "Male"/"Female")
+        if (c.col_type === 'numeric' || (c.col_type === 'categorical' && c.n_unique === 2)) {
             dvSelect.innerHTML += `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`;
         }
     });
@@ -436,8 +458,24 @@ function populateVariableSelectors() {
         ivList.innerHTML = '<p class="empty-hint">No variables found in data.</p>';
     }
 
-    // Population interaction term dropdowns
+    // Populate interaction term dropdowns
     populateInteractionDropdowns();
+
+    // Populate MixedLM group variable and Panel entity/time selectors
+    // All columns are eligible (including categorical and ID columns)
+    const allColsOptions = columns.map(c =>
+        `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)} (${c.col_type})</option>`
+    ).join('');
+    const dropdownsToPopulate = [
+        'opt-group-var', 'opt-entity-var', 'opt-time-var',
+    ];
+    dropdownsToPopulate.forEach(id => {
+        const sel = document.getElementById(id);
+        if (sel) sel.innerHTML = '<option value="">-- Select --</option>' + allColsOptions;
+    });
+
+    // Populate filter column dropdown
+    populateFilterUI();
 }
 
 // =========================================================================
@@ -461,6 +499,14 @@ function initModelForm() {
 
     runBtn.addEventListener('click', runRegression);
 
+    // MixedLM / Panel selector listeners
+    const groupVarSelect = document.getElementById('opt-group-var');
+    const entityVarSelect = document.getElementById('opt-entity-var');
+    const timeVarSelect = document.getElementById('opt-time-var');
+    if (groupVarSelect) groupVarSelect.addEventListener('change', checkRunButton);
+    if (entityVarSelect) entityVarSelect.addEventListener('change', checkRunButton);
+    if (timeVarSelect) timeVarSelect.addEventListener('change', checkRunButton);
+
     // Interaction term controls
     initInteractions();
 
@@ -468,24 +514,62 @@ function initModelForm() {
     document.getElementById('btn-save-model').addEventListener('click', saveModelForComparison);
     document.getElementById('btn-compare-models').addEventListener('click', compareModels);
     document.getElementById('btn-clear-compare').addEventListener('click', clearModelHistory);
+
+    // Data filter controls
+    initDataFilter();
 }
 
 function onModelTypeChange() {
     const modelType = document.getElementById('opt-model-type').value;
-    const isLogit = modelType === 'logit';
+    const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(modelType);
+    const isMixedLM = modelType === 'mixedlm';
+    const isPanel = modelType === 'panel';
+    const isPanelML = isMixedLM || isPanel;
+
+    // MLE models use MLE, no HC covariance types. Also hide for MixedLM / Panel.
     const covSelect = document.getElementById('opt-cov');
-    // Logit uses MLE, no HC covariance types
     if (covSelect) {
-        covSelect.disabled = isLogit;
-        if (isLogit) covSelect.value = 'nonrobust';
+        covSelect.disabled = isMLE || isPanelML;
+        if (isMLE || isPanelML) covSelect.value = 'nonrobust';
     }
-    // Interaction terms are still valid for logit
+
+    // Show/hide MixedLM group variable selector
+    const mixedlmControls = document.getElementById('mixedlm-controls');
+    if (mixedlmControls) {
+        mixedlmControls.classList.toggle('hidden', !isMixedLM);
+    }
+
+    // Show/hide Panel entity / time / model selectors
+    const panelControls = document.getElementById('panel-controls');
+    if (panelControls) {
+        panelControls.classList.toggle('hidden', !isPanel);
+    }
+
+    // Re-validate run button (extra required fields for mixedlm/panel)
+    checkRunButton();
 }
 
 function checkRunButton() {
     const dv = document.getElementById('dep-var-select').value;
     const checked = document.querySelectorAll('#indep-var-list input[type="checkbox"]:checked');
-    document.getElementById('btn-run-regression').disabled = !dv || checked.length === 0;
+    const modelType = document.getElementById('opt-model-type').value;
+
+    let canRun = dv && checked.length > 0;
+
+    // MixedLM: require group_var
+    if (modelType === 'mixedlm') {
+        const groupVar = document.getElementById('opt-group-var').value;
+        if (!groupVar) canRun = false;
+    }
+
+    // Panel: require entity_var and time_var
+    if (modelType === 'panel') {
+        const entityVar = document.getElementById('opt-entity-var').value;
+        const timeVar = document.getElementById('opt-time-var').value;
+        if (!entityVar || !timeVar) canRun = false;
+    }
+
+    document.getElementById('btn-run-regression').disabled = !canRun;
 }
 
 function getSelectedIVs() {
@@ -504,7 +588,31 @@ function initInteractions() {
 function populateInteractionDropdowns() {
     const columns = STATE.columns || [];
     const numericVars = columns.filter(c => c.col_type === 'numeric');
-    const options = numericVars.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+
+    // Also include binary categorical variables (exactly 2 unique values)
+    // These can be safely multiplied as 0/1 after encoding
+    const binaryCategoricalVars = [];
+    if (STATE.data && STATE.data.length > 1) {
+        const headerRow = STATE.data[0];
+        for (const col of columns) {
+            if (col.col_type === 'categorical' || col.col_type === 'binary') {
+                const colIdx = headerRow.indexOf(col.name);
+                if (colIdx >= 0) {
+                    const values = new Set();
+                    for (let i = 1; i < STATE.data.length; i++) {
+                        const v = STATE.data[i][colIdx];
+                        if (v != null && v !== '') values.add(v);
+                    }
+                    if (values.size === 2) {
+                        binaryCategoricalVars.push(col);
+                    }
+                }
+            }
+        }
+    }
+
+    const allVars = [...numericVars, ...binaryCategoricalVars];
+    const options = allVars.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
 
     const sel1 = document.getElementById('interaction-var1');
     const sel2 = document.getElementById('interaction-var2');
@@ -572,6 +680,109 @@ function getInteractions() {
 }
 
 // =========================================================================
+// Data Filter
+// =========================================================================
+
+function initDataFilter() {
+    const filterSection = document.getElementById('data-filter-section');
+    const filterColSelect = document.getElementById('filter-col-select');
+    const btnApply = document.getElementById('btn-apply-filter');
+    const btnClear = document.getElementById('btn-clear-filter');
+
+    filterColSelect.addEventListener('change', onFilterColumnChange);
+    btnApply.addEventListener('click', applyDataFilter);
+    btnClear.addEventListener('click', clearDataFilter);
+}
+
+function populateFilterUI() {
+    const filterSection = document.getElementById('data-filter-section');
+    if (!STATE.columns || STATE.columns.length === 0) {
+        filterSection.classList.add('hidden');
+        return;
+    }
+    filterSection.classList.remove('hidden');
+
+    const filterColSelect = document.getElementById('filter-col-select');
+    const currentVal = filterColSelect.value;
+    filterColSelect.innerHTML = '<option value="">-- Select column to filter --</option>';
+    STATE.columns.forEach(c => {
+        if (c.col_type !== 'id') {
+            filterColSelect.innerHTML += `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)} (${c.col_type})</option>`;
+        }
+    });
+    if (currentVal && STATE.columns.some(c => c.name === currentVal)) {
+        filterColSelect.value = currentVal;
+    }
+}
+
+function onFilterColumnChange() {
+    const colName = document.getElementById('filter-col-select').value;
+    const numControls = document.getElementById('filter-numeric-controls');
+    const catControls = document.getElementById('filter-cat-controls');
+    numControls.classList.add('hidden');
+    catControls.classList.add('hidden');
+
+    if (!colName || !STATE.columns) return;
+
+    const colMeta = STATE.columns.find(c => c.name === colName);
+    if (!colMeta) return;
+
+    if (colMeta.col_type === 'numeric') {
+        numControls.classList.remove('hidden');
+    } else if (colMeta.col_type === 'categorical') {
+        catControls.classList.remove('hidden');
+        // Populate checkboxes from data
+        const colIdx = STATE.data[0].indexOf(colName);
+        const uniqueVals = [...new Set(STATE.data.slice(1).map(r => r[colIdx]).filter(v => v != null))].sort();
+        const checkboxesDiv = document.getElementById('filter-cat-checkboxes');
+        checkboxesDiv.innerHTML = uniqueVals.map(v => `
+            <label>
+                <input type="checkbox" value="${escapeHtml(String(v))}" checked> ${escapeHtml(String(v))}
+            </label>
+        `).join('');
+    }
+}
+
+function applyDataFilter() {
+    const colName = document.getElementById('filter-col-select').value;
+    if (!colName) {
+        showError('model-error', 'Select a column to filter.');
+        return;
+    }
+    const colMeta = STATE.columns.find(c => c.name === colName);
+    if (!colMeta) return;
+
+    if (colMeta.col_type === 'numeric') {
+        const minVal = parseFloat(document.getElementById('filter-num-min').value);
+        const maxVal = parseFloat(document.getElementById('filter-num-max').value);
+        if (isNaN(minVal) && isNaN(maxVal)) {
+            showError('model-error', 'Enter at least one range value.');
+            return;
+        }
+        STATE.filterEnabled = true;
+        STATE.filterConditions = { col: colName, type: 'numeric', min: isNaN(minVal) ? null : minVal, max: isNaN(maxVal) ? null : maxVal };
+    } else {
+        const checked = document.querySelectorAll('#filter-cat-checkboxes input[type="checkbox"]:checked');
+        STATE.filterEnabled = true;
+        STATE.filterConditions = { col: colName, type: 'categorical', values: Array.from(checked).map(cb => cb.value) };
+    }
+    clearError('model-error');
+    document.getElementById('btn-apply-filter').textContent = 'Filter Applied';
+    setTimeout(() => { document.getElementById('btn-apply-filter').textContent = 'Apply Filter'; }, 1500);
+}
+
+function clearDataFilter() {
+    STATE.filterEnabled = false;
+    STATE.filterConditions = null;
+    document.getElementById('filter-col-select').value = '';
+    document.getElementById('filter-numeric-controls').classList.add('hidden');
+    document.getElementById('filter-cat-controls').classList.add('hidden');
+    document.getElementById('filter-num-min').value = '';
+    document.getElementById('filter-num-max').value = '';
+    clearError('model-error');
+}
+
+// =========================================================================
 // Run Regression
 // =========================================================================
 
@@ -585,6 +796,7 @@ async function runRegression() {
     try {
         const pyodide = STATE.pyodide;
         const dataJson = JSON.stringify({ data: STATE.data, columns: STATE.columns });
+        const modelType = document.getElementById('opt-model-type').value;
         const spec = {
             dep_var: document.getElementById('dep-var-select').value,
             indep_vars: getSelectedIVs(),
@@ -592,14 +804,31 @@ async function runRegression() {
             alpha: parseFloat(document.getElementById('opt-alpha').value),
             cov_type: document.getElementById('opt-cov').value,
             missing_strategy: document.getElementById('opt-missing').value,
-            model_type: document.getElementById('opt-model-type').value,
+            model_type: modelType,
         };
+
+        // MixedLM: pass group variable
+        if (modelType === 'mixedlm') {
+            spec.group_var = document.getElementById('opt-group-var').value;
+        }
+
+        // Panel: pass entity, time, and panel model type
+        if (modelType === 'panel') {
+            spec.entity_var = document.getElementById('opt-entity-var').value;
+            spec.time_var = document.getElementById('opt-time-var').value;
+            spec.panel_model = document.getElementById('opt-panel-model').value;
+        }
 
         // Collect transforms and interactions from UI
         const transforms = getTransforms();
         const interactions = getInteractions();
         if (transforms) spec.transforms = transforms;
         if (interactions) spec.interactions = interactions;
+
+        // Pass data filter conditions
+        if (STATE.filterEnabled && STATE.filterConditions) {
+            spec.filter = STATE.filterConditions;
+        }
 
         // Serialize spec for model history and bridge
         const specJson = JSON.stringify(spec);
@@ -634,15 +863,21 @@ async function runRegression() {
             generateCoefficientChart(resultJson),
         ];
 
-        // OLS-specific tasks
-        if (result.model_type !== 'logit') {
+        // Diagnostics (OLS/Panel/MixedLM only — VIF/residual tests don't apply to MLE)
+        const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(result.model_type);
+        if (!isMLE) {
             parallelTasks.push(computeAndRenderDiagnostics(dataJson, resultJson));
-            parallelTasks.push(generateAllScatterCharts(dataJson, result));
         }
 
-        // Logit-specific tasks
+        // Scatter plots: available for all model types
+        parallelTasks.push(generateAllScatterCharts(dataJson, result));
+
+        // Logit/Probit-specific tasks (ROC is available for both binary choice models)
+        if (result.model_type === 'logit' || result.model_type === 'probit') {
+            parallelTasks.push(generateROCChart(resultJson));
+        }
+        // OR chart only for logit
         if (result.model_type === 'logit') {
-            parallelTasks.push(generateROCChart(dataJson, result.dep_var));
             parallelTasks.push(generateORChart(resultJson));
         }
 
@@ -673,7 +908,7 @@ function renderResults(result) {
     renderStatsGrid(result);
 
     // Coefficient table
-    renderCoefficientTable(result.coefficients || []);
+    renderCoefficientTable(result.coefficients || [], result.variable_labels || {});
 
     // ANOVA table (if diagnostics available)
     if (STATE.diagnostics && STATE.diagnostics.anova) {
@@ -686,10 +921,16 @@ function renderResults(result) {
 
 function renderStatsGrid(result) {
     const grid = document.getElementById('model-stats-grid');
-    const isLogit = result.model_type === 'logit';
+    const mt = result.model_type;
+    const isLogit = mt === 'logit';
+    const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(mt);
+    const isCount = ['poisson', 'negbin'].includes(mt);
+    const isPanel = mt === 'panel';
+    const isMixedLM = mt === 'mixedlm';
+    const isOLS = mt === 'OLS' || !isMLE && !isPanel && !isMixedLM;
     const stats = [];
 
-    if (isLogit) {
+    if (isMLE) {
         stats.push(
             { label: 'Pseudo R-squared', value: fmtNum(result.pseudo_r_squared, '.6f') },
             { label: 'Log-Likelihood', value: fmtNum(result.log_likelihood, '.2f') },
@@ -700,7 +941,52 @@ function renderStatsGrid(result) {
                 value: `${fmtNum(result.llr, '.4f')} (p=${fmtPvalue(result.llr_pvalue)})`,
             });
         }
+        if (isCount && result.dispersion != null) {
+            stats.push({ label: 'Dispersion', value: fmtNum(result.dispersion, '.4f') });
+        }
+        if (isLogit) {
+            stats.push({ label: 'Method', value: 'Logit (MLE)' });
+        } else if (mt === 'probit') {
+            stats.push({ label: 'Method', value: 'Probit (MLE)' });
+        } else if (mt === 'poisson') {
+            stats.push({ label: 'Method', value: 'Poisson (MLE)' });
+        } else if (mt === 'negbin') {
+            stats.push({ label: 'Method', value: 'NegativeBinomial (MLE)' });
+        }
+    } else if (isPanel) {
+        if (result.within_r_squared != null) {
+            stats.push({ label: 'Within R²', value: fmtNum(result.within_r_squared, '.6f') });
+        }
+        if (result.between_r_squared != null) {
+            stats.push({ label: 'Between R²', value: fmtNum(result.between_r_squared, '.6f') });
+        }
+        if (result.overall_r_squared != null) {
+            stats.push({ label: 'Overall R²', value: fmtNum(result.overall_r_squared, '.6f') });
+        }
+        if (result.f_statistic) {
+            stats.push({
+                label: 'F-statistic',
+                value: `${fmtNum(result.f_statistic[0], '.4f')} (p=${fmtPvalue(result.f_statistic[1])})`,
+            });
+        }
+        stats.push(
+            { label: 'Entities', value: result.entity_count || 'N/A' },
+            { label: 'Periods', value: result.time_count || 'N/A' },
+        );
+    } else if (isMixedLM) {
+        stats.push(
+            { label: 'R-squared', value: fmtNum(result.r_squared, '.6f') },
+            { label: 'Adj R-squared', value: fmtNum(result.adj_r_squared, '.6f') },
+            { label: 'RMSE', value: fmtNum(result.rmse, '.4f') },
+            { label: 'Groups', value: result.group_count || 'N/A' },
+        );
+        if (result.re_var) {
+            Object.keys(result.re_var).forEach(k => {
+                stats.push({ label: `RE: ${k}`, value: fmtNum(result.re_var[k], '.4f') });
+            });
+        }
     } else {
+        // OLS (default)
         stats.push(
             { label: 'R-squared', value: fmtNum(result.r_squared, '.6f') },
             { label: 'Adj R-squared', value: fmtNum(result.adj_r_squared, '.6f') },
@@ -719,7 +1005,7 @@ function renderStatsGrid(result) {
         { label: 'BIC', value: fmtNum(result.bic, '.2f') },
         { label: 'N', value: result.n_obs },
     );
-    if (!isLogit) {
+    if (isOLS || isPanel || isMixedLM) {
         stats.push({ label: 'Log-Likelihood', value: fmtNum(result.log_likelihood, '.2f') });
     }
 
@@ -731,16 +1017,21 @@ function renderStatsGrid(result) {
     `).join('');
 }
 
-function renderCoefficientTable(coefs) {
-    const isLogit = STATE.result && STATE.result.model_type === 'logit';
-    const statLabel = isLogit ? 'z-value' : 't-value';
-    const statField = isLogit ? 'z_stat' : 't_stat';
+function renderCoefficientTable(coefs, variableLabels) {
+    variableLabels = variableLabels || {};
+    const mt = STATE.result ? STATE.result.model_type : '';
+    const isLogit = mt === 'logit';
+    const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(mt);
+    const isCount = ['poisson', 'negbin'].includes(mt);
+    const statLabel = isMLE ? 'z-value' : 't-value';
+    const statField = isMLE ? 'z_stat' : 't_stat';
 
     // Update table header
     const thead = document.querySelector('#coef-table thead tr');
     let headerHTML = '<th>Variable</th><th>Coefficient</th><th>Std. Error</th>';
     headerHTML += `<th>${statLabel}</th>`;
     if (isLogit) headerHTML += '<th>Odds Ratio</th>';
+    if (isCount) headerHTML += '<th>IRR</th>';
     headerHTML += '<th>p-value</th><th>95% CI Low</th><th>95% CI High</th><th>Sig.</th>';
     thead.innerHTML = headerHTML;
 
@@ -748,13 +1039,19 @@ function renderCoefficientTable(coefs) {
     tbody.innerHTML = coefs.map(c => {
         const pClass = c.pvalue < 0.05 ? 'p-significant' : (c.pvalue < 0.1 ? 'p-marginal' : '');
         const statVal = c[statField] != null ? c[statField] : (c.t_stat || 0);
+        const displayName = variableLabels[c.name] || c.name;
         let rowHTML = `<tr>
-            <td><strong>${escapeHtml(c.name)}</strong></td>
+            <td><strong>${escapeHtml(displayName)}</strong></td>
             <td class="numeric">${fmtNum(c.coef, '.6f')}</td>
             <td class="numeric">${fmtNum(c.se, '.6f')}</td>
             <td class="numeric">${fmtNum(statVal, '.4f')}</td>`;
         if (isLogit) {
+            // Only logit gets odds_ratio in the result dict
             rowHTML += `<td class="numeric">${fmtNum(c.odds_ratio, '.4f')}</td>`;
+        }
+        if (isCount) {
+            // Count models get IRR
+            rowHTML += `<td class="numeric">${fmtNum(c.irr, '.4f')}</td>`;
         }
         rowHTML += `<td class="numeric ${pClass}">${fmtPvalue(c.pvalue)}</td>
             <td class="numeric">${fmtNum(c.ci_lower, '.6f')}</td>
@@ -787,20 +1084,44 @@ function renderAnovaTable(anova) {
 
 function renderSummaryText(result) {
     const el = document.getElementById('summary-text');
-    const isLogit = result.model_type === 'logit';
+    const mt = result.model_type;
+    const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(mt);
+    const isLogit = mt === 'logit';
+    const isCount = ['poisson', 'negbin'].includes(mt);
+    const isPanel = mt === 'panel';
+    const isMixedLM = mt === 'mixedlm';
     let text = '';
-    text += `${isLogit ? 'Logit' : 'OLS'} Regression: ${result.specification || 'Unspecified'}\n\n`;
+    const methodLabel = mt === 'logit' ? 'Logit' : mt === 'probit' ? 'Probit' :
+        mt === 'poisson' ? 'Poisson' : mt === 'negbin' ? 'NegativeBinomial' :
+        mt === 'mixedlm' ? 'MixedLM' : mt === 'panel' ? 'Panel' : 'OLS';
+    text += `${methodLabel} Regression: ${result.specification || 'Unspecified'}\n\n`;
 
-    if (isLogit) {
-        // Logit-specific stats
+    if (isMLE) {
         text += `Pseudo R-squared = ${result.pseudo_r_squared != null ? result.pseudo_r_squared.toFixed(4) : 'N/A'}.\n`;
         if (result.llr != null) {
             const llrP = result.llr_pvalue != null ? result.llr_pvalue : 1;
             const sigLabel = llrP < 0.001 ? '<0.001' : llrP < 0.05 ? '<0.05' : llrP < 0.1 ? '<0.10' : '>=0.10';
             text += `Overall model: LR chi2 = ${result.llr.toFixed(4)}, p ${sigLabel}.\n`;
         }
+        if (isCount && result.dispersion != null) {
+            text += `Dispersion = ${result.dispersion.toFixed(4)}.\n`;
+        }
+    } else if (isPanel) {
+        if (result.within_r_squared != null) text += `Within R-squared = ${result.within_r_squared.toFixed(4)}.\n`;
+        if (result.between_r_squared != null) text += `Between R-squared = ${result.between_r_squared.toFixed(4)}.\n`;
+        if (result.overall_r_squared != null) text += `Overall R-squared = ${result.overall_r_squared.toFixed(4)}.\n`;
+        if (result.f_statistic) {
+            const fv = result.f_statistic[0], fp = result.f_statistic[1];
+            const sigLabel = fp < 0.001 ? '<0.001' : fp < 0.05 ? '<0.05' : fp < 0.1 ? '<0.10' : '>=0.10';
+            text += `Overall model: F = ${fv.toFixed(4)}, p ${sigLabel}.\n`;
+        }
+        text += `Entities = ${result.entity_count || 'N/A'}, Periods = ${result.time_count || 'N/A'}.\n`;
+    } else if (isMixedLM) {
+        text += `R-squared = ${result.r_squared != null ? result.r_squared.toFixed(4) : 'N/A'}`;
+        if (result.adj_r_squared != null) text += `, Adj R-squared = ${result.adj_r_squared.toFixed(4)}`;
+        text += `.\nRMSE = ${result.rmse != null ? result.rmse.toFixed(4) : 'N/A'}.\n`;
+        text += `Groups = ${result.group_count || 'N/A'}.\n`;
     } else {
-        // OLS-specific stats
         if (result.f_statistic) {
             const df1 = result.n_params - 1;
             const df2 = result.df_resid;
@@ -817,12 +1138,18 @@ function renderSummaryText(result) {
     text += `AIC = ${result.aic != null ? result.aic.toFixed(2) : 'N/A'}, BIC = ${result.bic != null ? result.bic.toFixed(2) : 'N/A'}.\n`;
     text += `N = ${result.n_obs}.\n\n`;
 
-    text += `${isLogit ? 'Logit ' : ''}Coefficients:\n`;
+    text += `${methodLabel} Coefficients:\n`;
     (result.coefficients || []).forEach(c => {
-        const statVal = isLogit ? (c.z_stat != null ? c.z_stat : c.t_stat || 0) : (c.t_stat || 0);
-        let coefLine = `  ${c.name.padEnd(20)} ${c.coef.toFixed(6).padStart(12)} (SE: ${c.se.toFixed(6)}, ${isLogit ? 'z' : 't'}=${statVal.toFixed(4)}, p=${fmtPvalue(c.pvalue)}) ${c.significance}`;
+        const statVal = isMLE ? (c.z_stat != null ? c.z_stat : c.t_stat) : c.t_stat;
+        const coefStr = c.coef != null ? c.coef.toFixed(6).padStart(12) : '         N/A';
+        const seStr = c.se != null ? c.se.toFixed(6) : 'N/A';
+        const statStr = statVal != null ? statVal.toFixed(4) : 'N/A';
+        let coefLine = `  ${c.name.padEnd(20)} ${coefStr} (SE: ${seStr}, ${isMLE ? 'z' : 't'}=${statStr}, p=${fmtPvalue(c.pvalue)}) ${c.significance}`;
         if (isLogit && c.odds_ratio != null) {
             coefLine += ` OR=${c.odds_ratio.toFixed(4)}`;
+        }
+        if (isCount && c.irr != null) {
+            coefLine += ` IRR=${c.irr.toFixed(4)}`;
         }
         text += coefLine + '\n';
     });
@@ -1149,11 +1476,11 @@ function renderScatterCharts() {
 // Logit-specific Charts: ROC and OR Forest Plot
 // =========================================================================
 
-async function generateROCChart(dataJson, depVar) {
+async function generateROCChart(resultJson) {
     try {
         const pyodide = STATE.pyodide;
         const chartJson = pyodide.runPython(`
-            generate_roc_chart(${JSON.stringify(dataJson)}, ${JSON.stringify(depVar)})
+            generate_roc_chart(${JSON.stringify(resultJson)})
         `);
         const chart = JSON.parse(chartJson);
         if (chart.success && chart.chart) {
@@ -1262,11 +1589,22 @@ function loadGalleryItem(id) {
     STATE.diagnostics = null;
     STATE.charts = null;
     STATE.coefChart = null;
+    STATE.modelHistory = [];
+    STATE.compareChart = null;
+    STATE.scatterCharts = {};
+    STATE.rocChart = null;
+    STATE.orChart = null;
 
     // Hide file info, update upload area
     document.getElementById('file-info').classList.add('hidden');
     document.getElementById('upload-area').classList.add('hidden');
     document.getElementById('data-error').classList.add('hidden');
+
+    // Clear stale model comparison UI and chart sections
+    clearModelHistory();
+    document.getElementById('roc-chart-section').classList.add('hidden');
+    document.getElementById('or-chart-section').classList.add('hidden');
+    document.getElementById('visualizations-section').classList.add('hidden');
 
     // Render data preview
     renderDataPreview();
@@ -1299,6 +1637,12 @@ function loadGalleryItem(id) {
 
     // Switch to results
     switchToTab('results');
+
+    // Generate scatter charts for Gallery items
+    if (STATE.pyodideReady) {
+        const dataJson = JSON.stringify({ data: STATE.data, columns: STATE.columns });
+        generateAllScatterCharts(dataJson, item.result);
+    }
 
     console.log('[Gallery] Loaded:', item.title, 'N:', item.n_obs);
 }
@@ -1340,11 +1684,79 @@ function computeDiagnosticsFromResult(result, data) {
     // Simple VIF (placeholder - full computation needs Pyodide)
     let vif = null;
 
-    // Residual diagnostics (placeholders)
-    let residual_tests = {
-        shapiro_normal: "N/A (gallery)",
-        dw_autocorrelation: "N/A (gallery)",
-    };
+    // Residual diagnostics
+    let residual_tests = {};
+    if (residuals.length > 0 && STATE.pyodideReady) {
+        // Compute actual Shapiro-Wilk and Durbin-Watson via Pyodide
+        try {
+            const pyodide = STATE.pyodide;
+            const residualListJson = JSON.stringify(residuals);
+            const testsJson = pyodide.runPython(`
+import json
+import numpy as np
+
+residuals = np.array(json.loads('''${residualListJson}'''), dtype=float)
+
+result = {}
+# Shapiro-Wilk
+if len(residuals) >= 3:
+    try:
+        from scipy import stats
+        shapiro_stat, shapiro_p = stats.shapiro(residuals)
+        result["shapiro_stat"] = round(float(shapiro_stat), 6)
+        result["shapiro_pvalue"] = float(shapiro_p)
+        result["shapiro_normal"] = "Yes" if shapiro_p > 0.05 else "No"
+    except Exception:
+        result["shapiro_normal"] = "Error"
+else:
+    result["shapiro_normal"] = "Insufficient data"
+
+# Durbin-Watson
+if len(residuals) >= 2:
+    try:
+        diff_sum = np.sum(np.diff(residuals) ** 2)
+        total_sum = np.sum(residuals ** 2)
+        if total_sum > 0:
+            dw = float(diff_sum / total_sum)
+            result["dw_stat"] = round(dw, 4)
+            if dw < 1.0:
+                result["dw_autocorrelation"] = "Positive (strong)"
+            elif dw > 3.0:
+                result["dw_autocorrelation"] = "Negative (strong)"
+            elif dw < 1.5:
+                result["dw_autocorrelation"] = "Positive (mild)"
+            elif dw > 2.5:
+                result["dw_autocorrelation"] = "Negative (mild)"
+            else:
+                result["dw_autocorrelation"] = "None"
+        else:
+            result["dw_autocorrelation"] = "N/A (zero variance)"
+    except Exception:
+        result["dw_autocorrelation"] = "Error"
+else:
+    result["dw_autocorrelation"] = "Insufficient data"
+
+json.dumps(result)
+            `);
+            residual_tests = JSON.parse(testsJson);
+        } catch (err) {
+            console.error('[Diagnostics] Pyodide computation error:', err);
+            residual_tests = {
+                shapiro_normal: "Error computing diagnostics",
+                dw_autocorrelation: "Error computing diagnostics",
+            };
+        }
+    } else if (residuals.length > 0 && !STATE.pyodideReady) {
+        residual_tests = {
+            shapiro_normal: "N/A (Pyodide not loaded)",
+            dw_autocorrelation: "N/A (Pyodide not loaded)",
+        };
+    } else {
+        residual_tests = {
+            shapiro_normal: "N/A (no residuals)",
+            dw_autocorrelation: "N/A (no residuals)",
+        };
+    }
 
     return {
         success: true,
@@ -1446,7 +1858,11 @@ async function exportFormat(format) {
                 csvResult = { success: true, csv: generateCSVFromResult(STATE.result) };
             }
             if (csvResult.success) {
-                downloadBlob(csvResult.csv, 'regression_results.csv', 'text/csv');
+                let csv = csvResult.csv;
+                if (STATE.galleryLoaded) {
+                    csv = '# Note: This result is from a pre-computed Gallery sample. Some statistics may be approximate.\n' + csv;
+                }
+                downloadBlob(csv, 'regression_results.csv', 'text/csv');
             }
         } else if (format === 'excel') {
             if (pyodide && STATE.pyodideReady && !STATE.galleryLoaded) {
@@ -1457,12 +1873,19 @@ async function exportFormat(format) {
                     for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
                     downloadBlob(new Blob([bytes]), excelResult.filename || 'regression_results.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
                 } else {
-                    alert('Excel export requires Pyodide. Downloading CSV instead.');
-                    exportFormat('csv');
+                    showError('export-error', 'Excel export failed. Downloading CSV instead.');
+                    const csvResult2 = JSON.parse(pyodide.runPython(`export_csv(${JSON.stringify(resultStr)})`));
+                    if (csvResult2.success) {
+                        downloadBlob(csvResult2.csv, 'regression_results.csv', 'text/csv');
+                    }
                 }
             } else {
-                alert('Excel export requires Pyodide runtime. Downloading CSV instead.');
-                exportFormat('csv');
+                showError('export-error', 'Excel export requires Pyodide runtime. Downloading CSV instead.');
+                let csv = generateCSVFromResult(STATE.result);
+                if (STATE.galleryLoaded) {
+                    csv = '# Note: This result is from a pre-computed Gallery sample. Some statistics may be approximate.\n' + csv;
+                }
+                downloadBlob(csv, 'regression_results.csv', 'text/csv');
             }
         }
     } catch (err) {
@@ -1472,26 +1895,30 @@ async function exportFormat(format) {
 }
 
 function generateCSVFromResult(result) {
-    const isLogit = result.model_type === 'logit';
-    const statLabel = isLogit ? 'z-value' : 't-value';
-    const statField = isLogit ? 'z_stat' : 't_stat';
-    const orHeader = isLogit ? ',Odds Ratio' : '';
+    const mt = result.model_type || '';
+    const isMLE = ['logit', 'probit', 'poisson', 'negbin'].includes(mt);
+    const isLogit = mt === 'logit';
+    const isCount = ['poisson', 'negbin'].includes(mt);
+    const statLabel = isMLE ? 'z-value' : 't-value';
+    const statField = isMLE ? 'z_stat' : 't_stat';
+    const extraHeader = isLogit ? ',Odds Ratio' : (isCount ? ',IRR' : '');
+    const extraField = isLogit ? 'odds_ratio' : (isCount ? 'irr' : '');
 
-    let lines = [`Variable,Coefficient,Std.Err.,${statLabel}${orHeader},p-value,CI(95%) Low,CI(95%) High,Significance`];
+    let lines = [`Variable,Coefficient,Std.Err.,${statLabel}${extraHeader},p-value,CI(95%) Low,CI(95%) High,Significance`];
     (result.coefficients || []).forEach(c => {
         const statVal = c[statField] != null ? c[statField] : (c.t_stat || 0);
-        const orVal = isLogit ? `,${c.odds_ratio || ''}` : '';
-        lines.push(`"${c.name}",${c.coef},${c.se},${statVal}${orVal},${c.pvalue},${c.ci_lower},${c.ci_upper},${c.significance}`);
+        const extraVal = extraField ? `,${c[extraField] || ''}` : '';
+        lines.push(`"${c.name}",${c.coef},${c.se},${statVal}${extraVal},${c.pvalue},${c.ci_lower},${c.ci_upper},${c.significance}`);
     });
     lines.push('');
     lines.push('# Model Summary');
-    if (isLogit) {
-        lines.push(`# Model Type,Logit`);
+    lines.push(`# Model Type,${mt.toUpperCase()}`);
+    if (isMLE) {
         lines.push(`# Pseudo R-squared,${result.pseudo_r_squared}`);
         lines.push(`# LR chi2,${result.llr}`);
         lines.push(`# LR p-value,${result.llr_pvalue}`);
+        if (isCount && result.dispersion != null) lines.push(`# Dispersion,${result.dispersion}`);
     } else {
-        lines.push(`# Model Type,OLS`);
         lines.push(`# R-squared,${result.r_squared}`);
         lines.push(`# Adj R-squared,${result.adj_r_squared}`);
         lines.push(`# RMSE,${result.rmse}`);
@@ -1512,7 +1939,22 @@ function exportText() {
 }
 
 function exportCharts() {
-    const chartIds = ['chart-residual-fitted', 'chart-qq', 'chart-scale-location', 'chart-cooks', 'coef-chart'];
+    // Lazy-render any unrendered chart DIVs (user may not have visited Diagnostics tab)
+    if (STATE.charts && !document.getElementById('chart-residual-fitted')._fullLayout) {
+        renderDiagnosticCharts();
+    }
+    if (STATE.coefChart && !document.getElementById('coef-chart')._fullLayout) {
+        renderCoefficientChart();
+    }
+    if (STATE.rocChart && !document.getElementById('roc-chart')._fullLayout) {
+        renderROCChart();
+    }
+    if (STATE.orChart && !document.getElementById('or-chart')._fullLayout) {
+        renderORChart();
+    }
+    // Build list of all chart containers that have been rendered
+    const chartIds = ['chart-residual-fitted', 'chart-qq', 'chart-scale-location', 'chart-cooks',
+                      'coef-chart', 'roc-chart', 'or-chart'];
     let exported = 0;
     chartIds.forEach(id => {
         const el = document.getElementById(id);
@@ -1522,7 +1964,11 @@ function exportCharts() {
         }
     });
     if (exported === 0) {
-        alert('No charts available to export. Run a regression and view diagnostics first.');
+        if (!STATE.charts && !STATE.coefChart) {
+            alert('No charts available to export. Run a regression first to generate charts.');
+        } else {
+            alert('No charts available to export. Please visit the Diagnostics and Results tabs first to render the charts, then try exporting again.');
+        }
     }
 }
 

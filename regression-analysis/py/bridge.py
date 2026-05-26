@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Pyodide bridge module for Regression Analysis web app.
 
 This module runs inside the Pyodide (WebAssembly) Python runtime.
@@ -16,8 +15,9 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -30,9 +30,9 @@ warnings.filterwarnings("ignore")
 # ===========================================================================
 
 
-def _detect_categorical_columns(df: pd.DataFrame) -> Dict[str, str]:
+def _detect_categorical_columns(df: pd.DataFrame) -> dict[str, str]:
     """Classify each column as 'numeric', 'categorical', or 'id'."""
-    types: Dict[str, str] = {}
+    types: dict[str, str] = {}
     nrows = len(df)
 
     for col in df.columns:
@@ -98,9 +98,17 @@ def parse_file(filename: str, content_b64: str) -> str:
     name_lower = filename.lower()
 
     try:
-        if name_lower.endswith(".csv") or name_lower.endswith(".tsv") or name_lower.endswith(".txt"):
+        if (name_lower.endswith(".csv")
+                or name_lower.endswith(".tsv")
+                or name_lower.endswith(".txt")):
             # Detect encoding and separator
-            sep = "\t" if name_lower.endswith(".tsv") else ","
+            if name_lower.endswith(".tsv"):
+                sep = "\t"
+            elif name_lower.endswith(".txt"):
+                # Auto-detect separator for .txt: count tabs vs commas in first few lines
+                sep = _detect_separator(content_bytes)
+            else:
+                sep = ","
             # Try UTF-8 first, then GBK
             for enc in ["utf-8", "gbk", "latin-1"]:
                 try:
@@ -113,7 +121,6 @@ def parse_file(filename: str, content_b64: str) -> str:
         elif name_lower.endswith(".xls") and not name_lower.endswith(".xlsx"):
             # Old .xls format: try xlrd first, then fallback to openpyxl
             try:
-                import xlrd  # noqa: F811
                 df = pd.read_excel(io.BytesIO(content_bytes), engine="xlrd")
             except (ImportError, Exception):
                 try:
@@ -164,6 +171,15 @@ def parse_file(filename: str, content_b64: str) -> str:
     })
 
 
+def _detect_separator(content_bytes: bytes) -> str:
+    """Auto-detect CSV separator by counting tabs vs commas in first few lines."""
+    sample = content_bytes[:4096].decode("utf-8", errors="ignore")
+    lines = sample.splitlines()[:10]
+    n_tabs = sum(line.count("\t") for line in lines if line.strip())
+    n_commas = sum(line.count(",") for line in lines if line.strip())
+    return "\t" if n_tabs > n_commas else ","
+
+
 def _safe_value(v: Any) -> Any:
     """Convert numpy/pandas types to JSON-safe Python types."""
     if pd.isna(v):
@@ -184,8 +200,91 @@ def _safe_value(v: Any) -> Any:
 # ===========================================================================
 
 
+def _validate_columns_metadata(columns_meta: Any, df: pd.DataFrame) -> bool:
+    """Validate that columns metadata is a non-empty list with required fields.
+
+    Checks that each entry has 'name' and 'col_type' fields, and that the
+    names match actual DataFrame column names.
+
+    Args:
+        columns_meta: The columns metadata list (or None/missing).
+        df: The DataFrame to validate against.
+
+    Returns:
+        True if metadata is valid and usable for dtype restoration.
+    """
+    if not isinstance(columns_meta, list) or len(columns_meta) == 0:
+        return False
+    df_cols = set(df.columns)
+    for entry in columns_meta:
+        if not isinstance(entry, dict):
+            return False
+        if "name" not in entry or "col_type" not in entry:
+            return False
+        if entry["name"] not in df_cols:
+            return False
+    return True
+
+
+def _apply_data_filter(df: pd.DataFrame, filter_spec: dict) -> pd.DataFrame:
+    """Apply row-subsetting filter to DataFrame.
+
+    Args:
+        df: DataFrame to filter.
+        filter_spec: {col, type: 'numeric'|'categorical', min, max, values}
+
+    Returns:
+        Filtered DataFrame.
+    """
+    col = filter_spec.get("col")
+    if not col or col not in df.columns:
+        return df
+    ftype = filter_spec.get("type", "")
+    if ftype == "numeric":
+        min_v = filter_spec.get("min")
+        max_v = filter_spec.get("max")
+        s = pd.to_numeric(df[col], errors="coerce")
+        if min_v is not None:
+            df = df[s >= min_v]
+        if max_v is not None:
+            df = df[s <= max_v]
+    elif ftype == "categorical":
+        values = filter_spec.get("values", [])
+        if values:
+            df = df[df[col].astype(str).isin(values)]
+    return df
+
+
+def _infer_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert columns that appear to be numeric from object/string dtype.
+
+    For each column, attempts pd.to_numeric coercion. If all original
+    non-null values successfully convert to numbers (no new NaN introduced),
+    the column is replaced with the numeric version.
+
+    Args:
+        df: DataFrame potentially with object-dtype columns.
+
+    Returns:
+        The same DataFrame with numeric columns converted in-place.
+    """
+    for col in df.columns:
+        col_series = df[col]
+        nonnull_mask = col_series.notna()
+        if nonnull_mask.sum() == 0:
+            continue
+        try:
+            converted = pd.to_numeric(col_series, errors="coerce")
+        except Exception:
+            continue
+        # Only convert if no original non-null values became NaN
+        if (nonnull_mask & converted.isna()).sum() == 0:
+            df[col] = converted
+    return df
+
+
 def run_regression(data_json: str, spec_json: str) -> str:
-    """Run an OLS regression.
+    """Run OLS or Logit regression.
 
     Args:
         data_json: JSON string with 'data' (list of lists) or 'columns'+'rows'.
@@ -216,10 +315,19 @@ def run_regression(data_json: str, spec_json: str) -> str:
             headers = rows[0]
             df = pd.DataFrame(rows[1:], columns=headers)
             # Convert numeric columns back from object dtype (JSON round-trip)
-            if "columns" in data_dict:
+            if _validate_columns_metadata(data_dict.get("columns"), df):
                 for col_info in data_dict["columns"]:
-                    if col_info.get("col_type") == "numeric" and isinstance(col_info.get("name"), str) and col_info["name"] in df.columns:
+                    if (col_info.get("col_type") == "numeric"
+                            and isinstance(col_info.get("name"), str)
+                            and col_info["name"] in df.columns):
                         df[col_info["name"]] = pd.to_numeric(df[col_info["name"]], errors="coerce")
+            else:
+                print(
+                    "[bridge] columns metadata missing or invalid, "
+                    "using dtype inference fallback",
+                    file=sys.stderr,
+                )
+                df = _infer_numeric_columns(df)
         elif "columns" in data_dict and "rows" in data_dict:
             df = pd.DataFrame(data_dict["rows"], columns=data_dict["columns"])
         else:
@@ -244,6 +352,14 @@ def run_regression(data_json: str, spec_json: str) -> str:
         if v not in df.columns:
             return json.dumps({"success": False, "error": f"Variable '{v}' not in data."})
 
+    # --- Apply data filter (row subsetting) ---
+    filter_spec = spec_dict.get("filter")
+    if filter_spec:
+        try:
+            df = _apply_data_filter(df, filter_spec)
+        except Exception as e:
+            return json.dumps({"success": False, "error": f"Data filter error: {e}"})
+
     # Drop rows with missing values in relevant columns
     cols_used = [dep_var] + indep_vars
     df_clean = df[cols_used].copy()
@@ -254,7 +370,11 @@ def run_regression(data_json: str, spec_json: str) -> str:
         for col in indep_vars:
             if df_clean[col].isna().any():
                 try:
-                    fill_val = df_clean[col].mean() if missing_strategy == "mean" else df_clean[col].median()
+                    fill_val = (
+                        df_clean[col].mean()
+                        if missing_strategy == "mean"
+                        else df_clean[col].median()
+                    )
                     df_clean[col] = df_clean[col].fillna(fill_val)
                 except Exception:
                     # Non-numeric column: fall back to mode
@@ -265,23 +385,42 @@ def run_regression(data_json: str, spec_json: str) -> str:
                         df_clean = df_clean.dropna(subset=[col])
 
             # Also handle dep_var missing values
+            # For logit models, use mode fill for the DV to avoid corrupting binary values
             if df_clean[dep_var].isna().any():
-                try:
-                    fill_val = df_clean[dep_var].mean() if missing_strategy == "mean" else df_clean[dep_var].median()
-                    df_clean[dep_var] = df_clean[dep_var].fillna(fill_val)
-                except Exception:
-                    df_clean = df_clean.dropna(subset=[dep_var])
+                if model_type in ("logit", "probit"):
+                    # Binary DV: fill with mode (most frequent class) instead of mean/median
+                    mode_vals = df_clean[dep_var].mode()
+                    if len(mode_vals) > 0:
+                        df_clean[dep_var] = df_clean[dep_var].fillna(mode_vals[0])
+                    else:
+                        df_clean = df_clean.dropna(subset=[dep_var])
+                else:
+                    try:
+                        fill_val = (
+                            df_clean[dep_var].mean()
+                            if missing_strategy == "mean"
+                            else df_clean[dep_var].median()
+                        )
+                        df_clean[dep_var] = df_clean[dep_var].fillna(fill_val)
+                    except Exception:
+                        df_clean = df_clean.dropna(subset=[dep_var])
 
     if len(df_clean) < 2:
-        return json.dumps({"success": False, "error": "Not enough valid observations after handling missing values."})
+        return json.dumps({
+            "success": False,
+            "error": "Not enough valid observations after handling missing values.",
+        })
 
     # --- Apply variable transformations ---
     transforms = spec_dict.get("transforms", {})
-    var_name_map: Dict[str, str] = {}  # original -> transformed column name
+    var_name_map: dict[str, str] = {}  # original -> transformed column name
     if transforms:
         for var, ttype in transforms.items():
             if var not in df_clean.columns:
-                return json.dumps({"success": False, "error": f"Transform variable '{var}' not in data."})
+                return json.dumps({
+                    "success": False,
+                    "error": f"Transform variable '{var}' not in data.",
+                })
             serie = pd.to_numeric(df_clean[var], errors="coerce")
             if ttype == "log":
                 new_col = f"{var}_log"
@@ -300,7 +439,10 @@ def run_regression(data_json: str, spec_json: str) -> str:
                 new_col = f"{var}_sq"
                 df_clean[new_col] = serie ** 2
             else:
-                return json.dumps({"success": False, "error": f"Unsupported transform type: {ttype}"})
+                return json.dumps({
+                    "success": False,
+                    "error": f"Unsupported transform type: {ttype}",
+                })
             var_name_map[var] = new_col
             # Replace var with transformed column in indep_vars list
             try:
@@ -309,7 +451,7 @@ def run_regression(data_json: str, spec_json: str) -> str:
             except ValueError:
                 pass
 
-    # --- Add interaction terms ---
+    # --- Validate interaction terms ---
     interactions_list = spec_dict.get("interactions", [])
     if interactions_list:
         for pair in interactions_list:
@@ -318,49 +460,167 @@ def run_regression(data_json: str, spec_json: str) -> str:
             actual_v1 = var_name_map.get(v1, v1)
             actual_v2 = var_name_map.get(v2, v2)
             if actual_v1 not in df_clean.columns:
-                return json.dumps({"success": False, "error": f"Interaction variable '{v1}' not in data after transforms."})
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Interaction variable '{v1}' "
+                        "not in data after transforms."
+                    ),
+                })
             if actual_v2 not in df_clean.columns:
-                return json.dumps({"success": False, "error": f"Interaction variable '{v2}' not in data after transforms."})
-            int_col = f"{v1}_x_{v2}"
-            df_clean[int_col] = df_clean[actual_v1].astype(float) * df_clean[actual_v2].astype(float)
-            indep_vars.append(int_col)
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Interaction variable '{v2}' "
+                        "not in data after transforms."
+                    ),
+                })
 
-    # Build design matrix
+    # Build design matrix (interactions handled inside, matching patsy structure)
     try:
-        X, y, coef_names, transform_map = _build_design_matrix(
-            df_clean, dep_var, indep_vars, has_intercept
+        X, y, coef_names, transform_map = _build_design_matrix(  # noqa: N806
+            df_clean, dep_var, indep_vars, has_intercept,
+            interactions=interactions_list,
         )
     except Exception as e:
         return json.dumps({"success": False, "error": f"Design matrix error: {e}"})
 
-    # Fit model (OLS or Logit)
+    # Fit model — dispatch to appropriate statsmodels class
     try:
         import statsmodels.api as sm
+
         if model_type == "logit":
-            # Logit requires binary response (0/1)
             y_unique = np.unique(y)
             if len(y_unique) != 2:
                 return json.dumps({
                     "success": False,
-                    "error": f"Logit requires a binary dependent variable. "
-                             f"Found {len(y_unique)} unique values in '{dep_var}': {list(y_unique)[:10]}."
+                    "error": (
+                        f"Logit requires a binary dependent variable. "
+                        f"Found {len(y_unique)} unique values "
+                        f"in '{dep_var}': {list(y_unique)[:10]}."
+                    ),
                 })
-            logit_model = sm.Logit(y, X)
-            fitted = logit_model.fit(disp=False)
-        else:
-            ols_model = sm.OLS(y, X)
-            if cov_type and cov_type != "nonrobust":
-                fitted = ols_model.fit(cov_type=cov_type)
+            fitted = sm.Logit(y, X).fit(disp=False)
+
+        elif model_type == "probit":
+            y_unique = np.unique(y)
+            if len(y_unique) != 2:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Probit requires a binary dependent variable. "
+                        f"Found {len(y_unique)} unique values "
+                        f"in '{dep_var}': {list(y_unique)[:10]}."
+                    ),
+                })
+            fitted = sm.Probit(y, X).fit(disp=False)
+
+        elif model_type in ("poisson", "negbin"):
+            # Validate count data requirements
+            if (y < 0).any():
+                return json.dumps({
+                    "success": False,
+                    "error": f"{model_type.capitalize()} requires non-negative "
+                             f"dependent variable. Found negative values in '{dep_var}'."
+                })
+            if not np.allclose(y, np.round(y), atol=1e-8):
+                return json.dumps({
+                    "success": False,
+                    "error": f"{model_type.capitalize()} requires integer-valued "
+                             f"dependent variable (count data)."
+                })
+            if model_type == "poisson":
+                family = sm.families.Poisson()
             else:
-                fitted = ols_model.fit()
+                family = sm.families.NegativeBinomial()
+            fitted = sm.GLM(y, X, family=family).fit()
+
+        elif model_type == "mixedlm":
+            # Need groups from spec
+            group_col = spec_dict.get("group_var", "")
+            if not group_col or group_col not in df.columns:
+                return json.dumps({
+                    "success": False,
+                    "error": "MixedLM requires a valid 'group_var' in the spec."
+                })
+            # Align groups with rows that survived cleaning
+            groups = df.loc[df_clean.index, group_col].values
+            fitted = sm.MixedLM(y, X, groups=groups).fit(reml=True, disp=False)
+
+        elif model_type == "panel":
+            try:
+                from linearmodels.panel import PanelOLS, RandomEffects
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": "Panel models require linearmodels package. "
+                             "Not available in this Pyodide environment."
+                })
+            entity_col = spec_dict.get("entity_var", "")
+            time_col = spec_dict.get("time_var", "")
+            if not entity_col or entity_col not in df.columns:
+                return json.dumps({
+                    "success": False,
+                    "error": "Panel model requires a valid 'entity_var' in the spec."
+                })
+            if not time_col or time_col not in df.columns:
+                return json.dumps({
+                    "success": False,
+                    "error": "Panel model requires a valid 'time_var' in the spec."
+                })
+            # Build panel index
+            valid_rows = df_clean.index
+            entity_vals = df.loc[valid_rows, entity_col].values
+            time_vals = df.loc[valid_rows, time_col].values
+            panel_idx = pd.MultiIndex.from_arrays(
+                [entity_vals, time_vals], names=[entity_col, time_col]
+            )
+            X_panel = pd.DataFrame(X, index=panel_idx)  # noqa: N806
+            y_panel = pd.Series(y, index=panel_idx)
+            panel_model_type = spec_dict.get("panel_model", "fixed")
+            if panel_model_type == "random":
+                model = RandomEffects(y_panel, X_panel)
+            else:
+                model = PanelOLS(y_panel, X_panel, entity_effects=True)
+            cov_type_spec = cov_type if cov_type and cov_type != "nonrobust" else None
+            if cov_type == "clustered" or cov_type_spec is None:
+                fitted = model.fit(cov_type="clustered", cluster_entity=True)
+            else:
+                fitted = model.fit(cov_type=cov_type_spec)
+
+        else:
+            # OLS (default)
+            if cov_type and cov_type != "nonrobust":
+                fitted = sm.OLS(y, X).fit(cov_type=cov_type)
+            else:
+                fitted = sm.OLS(y, X).fit()
+
     except Exception as e:
         return json.dumps({"success": False, "error": f"Fit error: {e}"})
 
-    # Extract results
+    # Extract results — dispatch to appropriate extractor
     if model_type == "logit":
         return _extract_logit_result(fitted, dep_var, indep_vars,
                                      coef_names, has_intercept, alpha,
                                      transform_map, df_clean)
+    elif model_type == "probit":
+        return _extract_probit_result(fitted, dep_var, indep_vars,
+                                      coef_names, has_intercept, alpha,
+                                      transform_map, df_clean)
+    elif model_type in ("poisson", "negbin"):
+        return _extract_count_result(fitted, dep_var, indep_vars,
+                                     coef_names, has_intercept, alpha,
+                                     transform_map, df_clean)
+    elif model_type == "mixedlm":
+        return _extract_mixedlm_result(fitted, dep_var, indep_vars,
+                                       coef_names, has_intercept, alpha,
+                                       transform_map, df_clean,
+                                       spec_dict)
+    elif model_type == "panel":
+        return _extract_panel_result(fitted, dep_var, indep_vars,
+                                     coef_names, has_intercept, alpha,
+                                     transform_map, df_clean,
+                                     spec_dict)
     else:
         return _extract_model_result(fitted, df_clean, dep_var, indep_vars,
                                      coef_names, has_intercept, alpha, cov_type,
@@ -370,35 +630,105 @@ def run_regression(data_json: str, spec_json: str) -> str:
 def _build_design_matrix(
     df: pd.DataFrame,
     dep_var: str,
-    indep_vars: List[str],
+    indep_vars: list[str],
     has_intercept: bool,
-) -> Tuple[np.ndarray, np.ndarray, List[str], Dict[str, List[str]]]:
+    interactions: list[tuple[str, str]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, list[str]]]:
     """Build design matrix X and response vector y.
 
-    Handles categorical variables by creating dummy variables.
-    Returns (X, y, coef_names, transform_map).
-    """
-    y = df[dep_var].astype(float).values
+    Handles categorical variables by creating dummy variables via
+    ``pd.get_dummies(drop_first=True)`` and optionally creates
+    interaction columns for categorical-numeric and categorical-categorical
+    pairs, matching the structure that patsy would produce.
 
-    parts = []
-    coef_names = []
-    transform_map: Dict[str, List[str]] = {}
+    Args:
+        df: Cleaned DataFrame with all needed columns.
+        dep_var: Name of dependent variable column.
+        indep_vars: List of independent variable column names.
+        has_intercept: Whether to include an intercept column.
+        interactions: Optional list of ``(var1, var2)`` interaction pairs.
+
+    Returns:
+        (X, y, coef_names, transform_map)
+    """
+    dep_series = df[dep_var]
+    if not pd.api.types.is_numeric_dtype(dep_series):
+        uniq = dep_series.dropna().unique()
+        if len(uniq) == 2:
+            mapping = {uniq[0]: 0, uniq[1]: 1}
+            dep_series = dep_series.map(mapping)
+        else:
+            dep_series = pd.to_numeric(dep_series, errors="coerce")
+    y = dep_series.astype(float).values
+
+    interactions = interactions or []
+
+    # ------------------------------------------------------------------
+    # Step 1: Build main-effect columns for each independent variable
+    # ------------------------------------------------------------------
+    var_columns: dict[str, tuple[list[str], np.ndarray]] = {}
 
     for var in indep_vars:
         series = df[var]
         if pd.api.types.is_numeric_dtype(series):
             vals = series.astype(float).values.reshape(-1, 1)
-            parts.append(vals)
-            coef_names.append(var)
-            transform_map[var] = [var]
+            names = [var]
         else:
             # Categorical: one-hot encode, drop first to avoid dummy trap
             dummies = pd.get_dummies(series, prefix=var, drop_first=True, dtype=float)
-            parts.append(dummies.values)
-            dummy_names = list(dummies.columns)
-            coef_names.extend(dummy_names)
-            transform_map[var] = dummy_names
+            names = list(dummies.columns)
+            vals = dummies.values
+        var_columns[var] = (names, vals)
 
+    # ------------------------------------------------------------------
+    # Step 2: Build interaction columns from the main-effect dummies
+    # ------------------------------------------------------------------
+    interaction_columns: dict[tuple[str, str], tuple[list[str], np.ndarray]] = {}
+    for v1, v2 in interactions:
+        if v1 not in var_columns or v2 not in var_columns:
+            raise ValueError(
+                f"Interaction variable '{v1}' or '{v2}' not found in indep_vars."
+            )
+        names1, vals1 = var_columns[v1]
+        names2, vals2 = var_columns[v2]
+
+        int_names: list[str] = []
+        int_vals_list: list[np.ndarray] = []
+        for i, n1 in enumerate(names1):
+            col1 = vals1[:, i]
+            for j, n2 in enumerate(names2):
+                col2 = vals2[:, j]
+                int_name = f"{n1}:{n2}"
+                int_val = col1 * col2
+                int_names.append(int_name)
+                int_vals_list.append(int_val)
+
+        if int_vals_list:
+            interaction_columns[(v1, v2)] = (
+                int_names,
+                np.column_stack(int_vals_list),
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: Assemble the full design matrix
+    # ------------------------------------------------------------------
+    parts: list[np.ndarray] = []
+    coef_names: list[str] = []
+    transform_map: dict[str, list[str]] = {}
+
+    for var in indep_vars:
+        names, vals = var_columns[var]
+        parts.append(vals)
+        coef_names.extend(names)
+        transform_map[var] = names
+
+    for (v1, v2), (names, vals) in interaction_columns.items():
+        parts.append(vals)
+        coef_names.extend(names)
+        int_key = f"{v1}:{v2}"
+        transform_map[int_key] = names
+
+    # Prepend intercept column (after main effects + interactions)
     if has_intercept:
         intercept_col = np.ones((len(y), 1))
         parts.insert(0, intercept_col)
@@ -407,22 +737,81 @@ def _build_design_matrix(
     if not parts:
         raise ValueError("No predictor variables to build design matrix.")
 
-    X = np.column_stack(parts)
+    X = np.column_stack(parts)  # noqa: N806
     return X, y, coef_names, transform_map
+
+
+def _build_variable_labels_for_web(
+    coef_names: list[str],
+    transform_map: dict[str, list[str]],
+) -> dict[str, str]:
+    """Build human-readable labels for coefficient names.
+
+    For categorical dummy columns (e.g. ``education_B``) the label is
+    ``education: B``.  Numeric columns and ``Intercept`` keep their
+    original names.  Interaction terms (containing ``:``) are split into
+    parts, each decoded individually, then joined with `` x ``.
+
+    Args:
+        coef_names: List of coefficient names from the design matrix.
+        transform_map: Mapping from original variable name (or interaction
+            key like ``"var1:var2"``) to the list of column names it
+            produced in the design matrix.
+
+    Returns:
+        Dictionary mapping each coefficient name to its display label.
+    """
+    # Build reverse lookup: column_name -> original variable / interaction key
+    col_to_var: dict[str, str] = {}
+    for var_name, col_names in transform_map.items():
+        for cname in col_names:
+            col_to_var[cname] = var_name
+
+    def _decode_single_part(part: str) -> str:
+        """Decode one part of a coefficient name (main effect or interaction fragment)."""
+        if part == "Intercept":
+            return "Intercept"
+        if part in col_to_var and col_to_var[part] != part:
+            var_name = col_to_var[part]
+            # The dummy column name is ``var_name + "_" + level``
+            level = part[len(var_name) + 1:]  # +1 for the "_" separator
+            return f"{var_name}: {level}"
+        return part
+
+    labels: dict[str, str] = {}
+    for name in coef_names:
+        if name == "Intercept":
+            labels[name] = "Intercept"
+        elif ":" in name:
+            # Interaction term: split on ":", decode each fragment, rejoin
+            fragments = name.split(":")
+            decoded = [_decode_single_part(p) for p in fragments]
+            labels[name] = " x ".join(decoded)
+        elif name in col_to_var and col_to_var[name] != name:
+            # Categorical dummy: extract level after the variable prefix
+            var_name = col_to_var[name]
+            level = name[len(var_name) + 1:]  # +1 for the "_" separator
+            labels[name] = f"{var_name}: {level}"
+        else:
+            labels[name] = name
+
+    return labels
 
 
 def _extract_model_result(
     fitted,
     df: pd.DataFrame,
     dep_var: str,
-    indep_vars: List[str],
-    coef_names: List[str],
+    indep_vars: list[str],
+    coef_names: list[str],
     has_intercept: bool,
     alpha: float,
     cov_type: str,
-    transform_map: Dict[str, List[str]],
+    transform_map: dict[str, list[str]],
 ) -> str:
     """Extract ModelResult from fitted statsmodels OLS and return JSON."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
     params = np.asarray(fitted.params)
     bse = np.asarray(fitted.bse)
     tvalues = np.asarray(fitted.tvalues)
@@ -434,12 +823,12 @@ def _extract_model_result(
         pv = float(pvalues[i])
         coefficients.append({
             "name": name,
-            "coef": float(params[i]) if not np.isnan(params[i]) else 0.0,
-            "se": float(bse[i]) if not np.isnan(bse[i]) else 0.0,
-            "t_stat": float(tvalues[i]) if not np.isnan(tvalues[i]) else 0.0,
-            "pvalue": pv if not np.isnan(pv) else 1.0,
-            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else 0.0,
-            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else 0.0,
+            "coef": float(params[i]) if not np.isnan(params[i]) else None,
+            "se": float(bse[i]) if not np.isnan(bse[i]) else None,
+            "t_stat": float(tvalues[i]) if not np.isnan(tvalues[i]) else None,
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else None,
+            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else None,
             "significance": _significance_stars(pv),
         })
 
@@ -456,7 +845,11 @@ def _extract_model_result(
         if not (np.isnan(fv) or np.isnan(fp)):
             f_stat = [fv, fp]
 
-    log_likelihood = float(fitted.llf) if hasattr(fitted, "llf") and fitted.llf is not None else None
+    log_likelihood = (
+        float(fitted.llf)
+        if hasattr(fitted, "llf") and fitted.llf is not None
+        else None
+    )
     aic = float(fitted.aic) if hasattr(fitted, "aic") else 0.0
     bic = float(fitted.bic) if hasattr(fitted, "bic") else 0.0
     ssr = float(fitted.ssr)
@@ -495,6 +888,7 @@ def _extract_model_result(
         "residuals": residuals,
         "fitted_values": fitted_values,
         "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
     }
 
     return json.dumps(result)
@@ -503,14 +897,16 @@ def _extract_model_result(
 def _extract_logit_result(
     fitted,
     dep_var: str,
-    indep_vars: List[str],
-    coef_names: List[str],
+    indep_vars: list[str],
+    coef_names: list[str],
     has_intercept: bool,
     alpha: float,
-    transform_map: Dict[str, List[str]],
+    transform_map: dict[str, list[str]],
     df_clean: pd.DataFrame,
 ) -> str:
     """Extract logit regression results into JSON."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
     params = np.asarray(fitted.params)
     bse = np.asarray(fitted.bse)
     zvalues = np.asarray(fitted.tvalues)  # statsmodels stores z as tvalues for Logit
@@ -520,18 +916,18 @@ def _extract_logit_result(
     coefficients = []
     for i, name in enumerate(coef_names):
         pv = float(pvalues[i])
-        coef_val = float(params[i]) if not np.isnan(params[i]) else 0.0
+        coef_val = float(params[i]) if not np.isnan(params[i]) else None
         coefficients.append({
             "name": name,
             "coef": coef_val,
-            "se": float(bse[i]) if not np.isnan(bse[i]) else 0.0,
-            "z_stat": float(zvalues[i]) if not np.isnan(zvalues[i]) else 0.0,
-            "pvalue": pv if not np.isnan(pv) else 1.0,
-            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else 0.0,
-            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else 0.0,
-            "odds_ratio": float(np.exp(coef_val)) if not np.isnan(coef_val) else 0.0,
-            "or_ci_lower": float(np.exp(conf_int[i, 0])) if not np.isnan(conf_int[i, 0]) else 0.0,
-            "or_ci_upper": float(np.exp(conf_int[i, 1])) if not np.isnan(conf_int[i, 1]) else 0.0,
+            "se": float(bse[i]) if not np.isnan(bse[i]) else None,
+            "z_stat": float(zvalues[i]) if not np.isnan(zvalues[i]) else None,
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else None,
+            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else None,
+            "odds_ratio": float(np.exp(coef_val)) if coef_val is not None else None,
+            "or_ci_lower": float(np.exp(conf_int[i, 0])) if not np.isnan(conf_int[i, 0]) else None,
+            "or_ci_upper": float(np.exp(conf_int[i, 1])) if not np.isnan(conf_int[i, 1]) else None,
             "significance": _significance_stars(pv),
         })
 
@@ -590,6 +986,479 @@ def _extract_logit_result(
         "fitted_values": fitted_values,
         "y_actual": y_actual,
         "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
+    }
+
+    return json.dumps(result)
+
+
+def _extract_probit_result(
+    fitted,
+    dep_var: str,
+    indep_vars: list[str],
+    coef_names: list[str],
+    has_intercept: bool,
+    alpha: float,
+    transform_map: dict[str, list[str]],
+    df_clean: pd.DataFrame,
+) -> str:
+    """Extract probit regression results into JSON (no odds ratios)."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
+    params = np.asarray(fitted.params)
+    bse = np.asarray(fitted.bse)
+    zvalues = np.asarray(fitted.tvalues)
+    pvalues = np.asarray(fitted.pvalues)
+    conf_int = np.asarray(fitted.conf_int(alpha=alpha))
+
+    coefficients = []
+    for i, name in enumerate(coef_names):
+        pv = float(pvalues[i])
+        coefficients.append({
+            "name": name,
+            "coef": float(params[i]) if not np.isnan(params[i]) else None,
+            "se": float(bse[i]) if not np.isnan(bse[i]) else None,
+            "z_stat": float(zvalues[i]) if not np.isnan(zvalues[i]) else None,
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else None,
+            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else None,
+            "significance": _significance_stars(pv),
+        })
+
+    n_obs = int(fitted.nobs)
+    n_params = int(fitted.df_model) + (1 if has_intercept else 0)
+    df_resid = int(fitted.df_resid)
+
+    ll_model = float(fitted.llf) if hasattr(fitted, "llf") and fitted.llf is not None else 0.0
+    ll_null = float(fitted.llnull) if hasattr(fitted, "llnull") else 0.0
+    pseudo_r_squared = float(1.0 - ll_model / ll_null) if ll_null != 0 else None
+
+    llr = float(fitted.llr) if hasattr(fitted, "llr") else None
+    llr_pvalue = float(fitted.llr_pvalue) if hasattr(fitted, "llr_pvalue") else None
+
+    log_likelihood = ll_model
+    aic = float(fitted.aic) if hasattr(fitted, "aic") else 0.0
+    bic = float(fitted.bic) if hasattr(fitted, "bic") else 0.0
+
+    residuals = fitted.resid_dev.tolist() if hasattr(fitted, "resid_dev") else []
+    fitted_values = fitted.fittedvalues.tolist() if hasattr(fitted, "fittedvalues") else []
+    y_actual = fitted.model.endog.tolist() if hasattr(fitted, "model") else []
+
+    preds_str = " + ".join(indep_vars)
+    spec_str = f"{dep_var} ~ {preds_str}"
+    if not has_intercept:
+        spec_str += " - 1"
+
+    result = {
+        "success": True,
+        "model_type": "probit",
+        "coefficients": coefficients,
+        "n_obs": n_obs,
+        "n_params": n_params,
+        "df_resid": df_resid,
+        "r_squared": None,
+        "adj_r_squared": None,
+        "pseudo_r_squared": pseudo_r_squared,
+        "llr": llr,
+        "llr_pvalue": llr_pvalue,
+        "log_likelihood": log_likelihood,
+        "aic": aic,
+        "bic": bic,
+        "rmse": None,
+        "dep_var": dep_var,
+        "specification": spec_str,
+        "method": "Probit",
+        "se_type": "MLE",
+        "residuals": residuals,
+        "fitted_values": fitted_values,
+        "y_actual": y_actual,
+        "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
+    }
+
+    return json.dumps(result)
+
+
+def _extract_count_result(
+    fitted,
+    dep_var: str,
+    indep_vars: list[str],
+    coef_names: list[str],
+    has_intercept: bool,
+    alpha: float,
+    transform_map: dict[str, list[str]],
+    df_clean: pd.DataFrame,
+) -> str:
+    """Extract Poisson/NegBin regression results into JSON (with IRR)."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
+    # Detect model subtype from GLM family
+    family_name = getattr(fitted.family, "family", "")
+    if "poisson" in family_name.lower():
+        model_subtype = "poisson"
+        method = "Poisson"
+    else:
+        model_subtype = "negbin"
+        method = "NegativeBinomial"
+
+    params = np.asarray(fitted.params)
+    bse = np.asarray(fitted.bse)
+    zvalues = np.asarray(fitted.tvalues)
+    pvalues = np.asarray(fitted.pvalues)
+    conf_int = np.asarray(fitted.conf_int(alpha=alpha))
+
+    coefficients = []
+    for i, name in enumerate(coef_names):
+        pv = float(pvalues[i])
+        coef_val = float(params[i]) if not np.isnan(params[i]) else None
+        coefficients.append({
+            "name": name,
+            "coef": coef_val,
+            "se": float(bse[i]) if not np.isnan(bse[i]) else None,
+            "z_stat": float(zvalues[i]) if not np.isnan(zvalues[i]) else None,
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": float(conf_int[i, 0]) if not np.isnan(conf_int[i, 0]) else None,
+            "ci_upper": float(conf_int[i, 1]) if not np.isnan(conf_int[i, 1]) else None,
+            "irr": float(np.exp(coef_val)) if coef_val is not None else None,
+            "significance": _significance_stars(pv),
+        })
+
+    n_obs = int(fitted.nobs)
+    n_params = int(fitted.df_model) + (1 if has_intercept else 0)
+    df_resid = int(fitted.df_resid)
+
+    ll_model = float(fitted.llf) if hasattr(fitted, "llf") and fitted.llf is not None else 0.0
+    try:
+        ll_null = float(fitted.llnull)
+    except (AttributeError, Exception):
+        ll_null = 0.0
+    pseudo_r_squared = float(1.0 - ll_model / ll_null) if ll_null != 0 else None
+
+    # LLR from deviance
+    llr = None
+    llr_pvalue = None
+    try:
+        deviance = float(fitted.deviance)
+        null_deviance = (
+            float(fitted.null_deviance)
+            if hasattr(fitted, "null_deviance")
+            else deviance
+        )
+        if null_deviance > deviance:
+            llr = float(null_deviance - deviance)
+            df_llr = int(fitted.df_model)
+            if llr > 0 and df_llr > 0:
+                from scipy import stats as scipy_stats
+                llr_pvalue = float(1.0 - scipy_stats.chi2.cdf(llr, df_llr))
+    except Exception:
+        pass
+
+    log_likelihood = ll_model
+    aic = float(fitted.aic) if hasattr(fitted, "aic") else 0.0
+    # BIC: prefer llf-based
+    bic = 0.0
+    if hasattr(fitted, "bic_llf"):
+        bic = float(fitted.bic_llf)
+    elif hasattr(fitted, "bic"):
+        bic = float(fitted.bic)
+
+    # Dispersion for NegBin
+    dispersion = None
+    if model_subtype == "negbin":
+        try:
+            dispersion = float(fitted.scale)
+        except Exception:
+            pass
+
+    residuals = fitted.resid_response.tolist() if hasattr(fitted, "resid_response") else []
+    fitted_values = fitted.fittedvalues.tolist() if hasattr(fitted, "fittedvalues") else []
+
+    preds_str = " + ".join(indep_vars)
+    spec_str = f"{dep_var} ~ {preds_str}"
+    if not has_intercept:
+        spec_str += " - 1"
+
+    result = {
+        "success": True,
+        "model_type": model_subtype,
+        "coefficients": coefficients,
+        "n_obs": n_obs,
+        "n_params": n_params,
+        "df_resid": df_resid,
+        "r_squared": None,
+        "adj_r_squared": None,
+        "pseudo_r_squared": pseudo_r_squared,
+        "llr": llr,
+        "llr_pvalue": llr_pvalue,
+        "log_likelihood": log_likelihood,
+        "aic": aic,
+        "bic": bic,
+        "rmse": None,
+        "dep_var": dep_var,
+        "specification": spec_str,
+        "method": method,
+        "se_type": "MLE",
+        "dispersion": dispersion,
+        "residuals": residuals,
+        "fitted_values": fitted_values,
+        "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
+    }
+
+    return json.dumps(result)
+
+
+def _extract_mixedlm_result(
+    fitted,
+    dep_var: str,
+    indep_vars: list[str],
+    coef_names: list[str],
+    has_intercept: bool,
+    alpha: float,
+    transform_map: dict[str, list[str]],
+    df_clean: pd.DataFrame,
+    spec_dict: dict,
+) -> str:
+    """Extract MixedLM regression results into JSON."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
+    fe_names = fitted.fe_params.index
+    params = fitted.fe_params
+    bse = fitted.bse_fe
+    tvalues = fitted.tvalues.loc[fe_names] if hasattr(fitted.tvalues, "loc") else fitted.tvalues
+    pvalues = fitted.pvalues.loc[fe_names] if hasattr(fitted.pvalues, "loc") else fitted.pvalues
+    conf_int = fitted.conf_int(alpha=alpha)
+
+    coefficients = []
+    for name in fe_names:
+        pv = float(pvalues[name])
+        conf_row = conf_int.loc[name] if hasattr(conf_int, "loc") else conf_int
+        ci_low_val = float(conf_row[0])
+        ci_high_val = float(conf_row[1])
+        coefficients.append({
+            "name": str(name),
+            "coef": float(params[name]),
+            "se": float(bse[name]),
+            "t_stat": float(tvalues[name]),
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": ci_low_val if not np.isnan(ci_low_val) else None,
+            "ci_upper": ci_high_val if not np.isnan(ci_high_val) else None,
+            "significance": _significance_stars(pv),
+        })
+
+    n_obs = int(fitted.nobs)
+    n_params = fitted.k_fe
+    df_resid = int(fitted.df_resid)
+
+    # R-squared from residuals
+    y_endog = fitted.model.endog
+    ss_resid = float(np.sum(fitted.resid ** 2))
+    ss_total = float(np.sum((y_endog - y_endog.mean()) ** 2))
+    r_squared = 1.0 - ss_resid / ss_total if ss_total > 0 else None
+    adj_r_squared = (
+        (1.0 - (1.0 - r_squared) * (n_obs - 1) / df_resid)
+        if r_squared is not None and df_resid > 0
+        else None
+    )
+
+    log_likelihood = (
+        float(fitted.llf)
+        if fitted.llf is not None and not np.isnan(fitted.llf)
+        else None
+    )
+
+    aic = 0.0
+    bic = 0.0
+    if hasattr(fitted, "aic") and not np.isnan(fitted.aic):
+        aic = float(fitted.aic)
+    if hasattr(fitted, "bic") and not np.isnan(fitted.bic):
+        bic = float(fitted.bic)
+
+    rmse = float(np.sqrt(ss_resid / df_resid)) if df_resid > 0 else None
+
+    # Random effects variance components
+    re_var = {}
+    if fitted.cov_re is not None and fitted.cov_re.size > 0:
+        for i, name in enumerate(fitted.cov_re.index):
+            re_var[str(name)] = float(fitted.cov_re.iloc[i, i])
+
+    residuals = fitted.resid.tolist() if hasattr(fitted, "resid") else []
+    fitted_values = fitted.fittedvalues.tolist() if hasattr(fitted, "fittedvalues") else []
+
+    group_col = spec_dict.get("group_var", "unknown")
+    group_count = 0
+    if hasattr(fitted, "random_effects"):
+        group_count = len(fitted.random_effects)
+
+    preds_str = " + ".join(indep_vars)
+    spec_str = f"{dep_var} ~ {preds_str}"
+    if not has_intercept:
+        spec_str += " - 1"
+    spec_str += f"  [groups: {group_col} ({group_count})]"
+
+    result = {
+        "success": True,
+        "model_type": "mixedlm",
+        "coefficients": coefficients,
+        "n_obs": n_obs,
+        "n_params": n_params,
+        "df_resid": df_resid,
+        "r_squared": r_squared,
+        "adj_r_squared": adj_r_squared,
+        "pseudo_r_squared": None,
+        "llr": None,
+        "llr_pvalue": None,
+        "log_likelihood": log_likelihood,
+        "aic": aic,
+        "bic": bic,
+        "rmse": rmse,
+        "dep_var": dep_var,
+        "specification": spec_str,
+        "method": "MixedLM (REML)",
+        "se_type": "MixedLM",
+        "group_var": group_col,
+        "group_count": group_count,
+        "re_var": re_var,
+        "residuals": residuals,
+        "fitted_values": fitted_values,
+        "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
+    }
+
+    return json.dumps(result)
+
+
+def _extract_panel_result(
+    fitted,
+    dep_var: str,
+    indep_vars: list[str],
+    coef_names: list[str],
+    has_intercept: bool,
+    alpha: float,
+    transform_map: dict[str, list[str]],
+    df_clean: pd.DataFrame,
+    spec_dict: dict,
+) -> str:
+    """Extract panel regression results into JSON."""
+    variable_labels = _build_variable_labels_for_web(coef_names, transform_map)
+
+    is_fe = hasattr(fitted, "included_effects")
+    panel_method = "Panel FE" if is_fe else "Panel RE"
+
+    params = fitted.params
+    std_errors = fitted.std_errors
+    t_stat_vals = fitted.tstats
+    p_vals = fitted.pvalues
+
+    # CI
+    try:
+        conf_int = fitted.conf_int(alpha=alpha)
+    except TypeError:
+        conf_int = fitted.conf_int()
+    ci_lower_col = "lower"
+    ci_upper_col = "upper"
+
+    coefficients = []
+    for var_name in params.index:
+        pv = float(p_vals[var_name])
+        coefficients.append({
+            "name": str(var_name),
+            "coef": float(params[var_name]),
+            "se": float(std_errors[var_name]),
+            "t_stat": float(t_stat_vals[var_name]),
+            "pvalue": pv if not np.isnan(pv) else None,
+            "ci_lower": float(conf_int.loc[var_name, ci_lower_col]),
+            "ci_upper": float(conf_int.loc[var_name, ci_upper_col]),
+            "significance": _significance_stars(pv),
+        })
+
+    n_obs = int(fitted.nobs)
+    n_params = int(fitted.df_model)
+    df_resid = int(fitted.df_resid)
+
+    # R-squared variants
+    within_r2 = float(fitted.rsquared_within) if hasattr(fitted, "rsquared_within") else None
+    between_r2 = float(fitted.rsquared_between) if hasattr(fitted, "rsquared_between") else None
+    overall_r2 = float(fitted.rsquared_overall) if hasattr(fitted, "rsquared_overall") else None
+    r_squared = within_r2 if within_r2 is not None else overall_r2
+
+    log_likelihood = None
+    try:
+        if hasattr(fitted, "loglik") and fitted.loglik is not None:
+            log_likelihood = float(fitted.loglik)
+    except Exception:
+        pass
+
+    aic = float(fitted.aic) if hasattr(fitted, "aic") else 0.0
+    bic = float(fitted.bic) if hasattr(fitted, "bic") else 0.0
+
+    rmse = None
+    if hasattr(fitted, "resid_ss") and df_resid > 0:
+        rmse = float(np.sqrt(fitted.resid_ss / df_resid))
+
+    # Entity / time counts
+    n_entities = 0
+    n_periods = 0
+    try:
+        n_entities = int(float(fitted.entity_info["total"]))
+    except Exception:
+        pass
+    try:
+        n_periods = int(float(fitted.time_info["total"]))
+    except Exception:
+        pass
+
+    residuals = []
+    fitted_values = []
+    try:
+        residuals = fitted.resids.values.flatten().tolist() if hasattr(fitted, "resids") else []
+    except Exception:
+        pass
+    try:
+        fitted_values = (
+            fitted.fitted_values.values.flatten().tolist()
+            if hasattr(fitted, "fitted_values")
+            else []
+        )
+    except Exception:
+        pass
+
+    preds_str = " + ".join(indep_vars)
+    spec_str = f"{dep_var} ~ {preds_str}"
+    if not has_intercept:
+        spec_str += " - 1"
+    spec_str += f"  [{panel_method}]"
+
+    result = {
+        "success": True,
+        "model_type": "panel",
+        "coefficients": coefficients,
+        "n_obs": n_obs,
+        "n_params": n_params,
+        "df_resid": df_resid,
+        "r_squared": r_squared,
+        "adj_r_squared": None,
+        "pseudo_r_squared": None,
+        "llr": None,
+        "llr_pvalue": None,
+        "log_likelihood": log_likelihood,
+        "aic": aic,
+        "bic": bic,
+        "rmse": rmse,
+        "dep_var": dep_var,
+        "specification": spec_str,
+        "method": panel_method,
+        "se_type": "clustered",
+        "within_r_squared": within_r2,
+        "between_r_squared": between_r2,
+        "overall_r_squared": overall_r2,
+        "entity_count": n_entities,
+        "time_count": n_periods,
+        "panel_type": panel_method,
+        "residuals": residuals,
+        "fitted_values": fitted_values,
+        "indep_vars": indep_vars,
+        "variable_labels": variable_labels,
     }
 
     return json.dumps(result)
@@ -648,7 +1517,7 @@ def compute_diagnostics(data_json: str, result_json: str) -> str:
     })
 
 
-def _compute_vif(data_json: str, result: dict) -> Optional[List[dict]]:
+def _compute_vif(data_json: str, result: dict) -> list[dict] | None:
     """Compute VIF for predictor variables."""
     try:
         from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -664,10 +1533,19 @@ def _compute_vif(data_json: str, result: dict) -> Optional[List[dict]]:
                 return None
             df = pd.DataFrame(rows[1:], columns=rows[0])
             # Convert numeric columns back from object dtype (JSON round-trip)
-            if "columns" in data_dict:
+            if _validate_columns_metadata(data_dict.get("columns"), df):
                 for col_info in data_dict["columns"]:
-                    if col_info.get("col_type") == "numeric" and isinstance(col_info.get("name"), str) and col_info["name"] in df.columns:
+                    if (col_info.get("col_type") == "numeric"
+                            and isinstance(col_info.get("name"), str)
+                            and col_info["name"] in df.columns):
                         df[col_info["name"]] = pd.to_numeric(df[col_info["name"]], errors="coerce")
+            else:
+                print(
+                    "[bridge] columns metadata missing or invalid, "
+                    "using dtype inference fallback",
+                    file=sys.stderr,
+                )
+                df = _infer_numeric_columns(df)
         else:
             return None
     except Exception:
@@ -683,8 +1561,8 @@ def _compute_vif(data_json: str, result: dict) -> Optional[List[dict]]:
         return None
 
     try:
-        X = df[numeric_vars].dropna().astype(float)
-        X_c = add_constant(X)
+        X = df[numeric_vars].dropna().astype(float)  # noqa: N806
+        X_c = add_constant(X)  # noqa: N806
 
         vif_rows = []
         for i in range(X_c.shape[1]):
@@ -748,7 +1626,7 @@ def _compute_residual_tests(residuals: np.ndarray) -> dict:
     return result
 
 
-def _compute_anova(rmse: float, r_squared: Optional[float],
+def _compute_anova(rmse: float, r_squared: float | None,
                    n_obs: int, n_params: int, result: dict) -> dict:
     """Compute ANOVA table from model results."""
     df_resid = result.get("df_resid", max(n_obs - n_params, 1))
@@ -828,7 +1706,6 @@ def generate_diagnostic_charts(result_json: str) -> str:
 
     residuals = np.array(result.get("residuals", []))
     fitted_values = np.array(result.get("fitted_values", []))
-    n_obs = result.get("n_obs", 0)
     n_params = result.get("n_params", 0)
 
     charts = {}
@@ -848,8 +1725,17 @@ def generate_diagnostic_charts(result_json: str) -> str:
     else:
         charts["scale_location"] = None
 
-    if len(residuals) >= 3:
+    model_type = result.get("model_type", "")
+    is_mle = model_type in ("logit", "probit", "poisson", "negbin")
+    if len(residuals) >= 3 and not is_mle:
         charts["cooks_distance"] = _make_cooks_chart(residuals, fitted_values, n_params)
+    elif is_mle:
+        # Cook's distance formula (OLS-based) is not applicable to MLE model deviance residuals
+        charts["cooks_distance"] = _make_unavailable_chart(
+            "Cook's Distance",
+            "Cook's distance is not applicable to MLE models. "
+            "Consider using Pregibon's delta-beta influence statistic instead."
+        )
     else:
         charts["cooks_distance"] = None
 
@@ -918,7 +1804,12 @@ def generate_coefficient_chart(result_json: str) -> str:
 
     layout = {
         "title": {"text": "Coefficient Estimates (Dot-Whisker)", "x": 0.5},
-        "xaxis": {"title": "Coefficient Estimate", "zeroline": True, "zerolinecolor": "gray", "zerolinewidth": 1},
+        "xaxis": {
+            "title": "Coefficient Estimate",
+            "zeroline": True,
+            "zerolinecolor": "gray",
+            "zerolinewidth": 1,
+        },
         "yaxis": {
             "tickvals": list(range(n)),
             "ticktext": list(reversed(names)),
@@ -1096,6 +1987,29 @@ def _make_cooks_chart(residuals: np.ndarray, fitted: np.ndarray,
     return {"data": traces, "layout": layout}
 
 
+def _make_unavailable_chart(title: str, message: str) -> dict:
+    """Create a placeholder chart showing a message when a diagnostic is unavailable."""
+    layout = {
+        "title": {"text": title, "x": 0.5},
+        "xaxis": {"visible": False},
+        "yaxis": {"visible": False},
+        "template": "plotly_white",
+        "annotations": [
+            {
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+                "text": message,
+                "showarrow": False,
+                "font": {"size": 13, "color": "#666"},
+                "xanchor": "center",
+            }
+        ],
+    }
+    return {"data": [], "layout": layout}
+
+
 # ===========================================================================
 # 5. Multi-model comparison chart
 # ===========================================================================
@@ -1120,7 +2034,7 @@ def compare_models(model_results_json: str) -> str:
         return json.dumps({"success": False, "error": "Need at least 2 models to compare."})
 
     # Collect all unique coefficient names (excluding Intercept) across models
-    all_coefs: List[str] = []
+    all_coefs: list[str] = []
     for m in models:
         coefs = m.get("result", {}).get("coefficients", [])
         for c in coefs:
@@ -1163,30 +2077,34 @@ def compare_models(model_results_json: str) -> str:
         estimates = []
         ci_lows = []
         ci_highs = []
-        text_labels = []
-
         for ci, name in enumerate(all_coefs):
             c = coef_dict.get(name)
             if c:
                 y_pos = n_coefs - 1 - ci + (mi - (n_models - 1) / 2) * 0.3
                 y_positions.append(y_pos)
                 estimates.append(c.get("coef", 0))
-                ci_lows.append(c.get("ci_lower", 0))
-                ci_highs.append(c.get("ci_upper", 0))
+                ci_low = c.get("ci_lower")
+                ci_high = c.get("ci_upper")
+                # Only add CI if both bounds are valid (not None, not both 0)
+                has_ci = (ci_low is not None and ci_high is not None and
+                          not (ci_low == 0 and ci_high == 0))
+                ci_lows.append(ci_low if has_ci else None)
+                ci_highs.append(ci_high if has_ci else None)
         if not estimates:
             continue
 
-        # CI whiskers
+        # CI whiskers — skip coefficients lacking valid CI data
         for i in range(len(estimates)):
-            traces.append({
-                "type": "scatter",
-                "x": [ci_lows[i], ci_highs[i]],
-                "y": [y_positions[i], y_positions[i]],
-                "mode": "lines",
-                "line": {"color": color, "width": 2},
-                "showlegend": False,
-                "hoverinfo": "none",
-            })
+            if ci_lows[i] is not None:
+                traces.append({
+                    "type": "scatter",
+                    "x": [ci_lows[i], ci_highs[i]],
+                    "y": [y_positions[i], y_positions[i]],
+                    "mode": "lines",
+                    "line": {"color": color, "width": 2},
+                    "showlegend": False,
+                    "hoverinfo": "none",
+                })
 
         # Dot markers
         traces.append({
@@ -1206,7 +2124,12 @@ def compare_models(model_results_json: str) -> str:
 
     layout = {
         "title": {"text": "Model Comparison: Coefficient Estimates", "x": 0.5},
-        "xaxis": {"title": "Coefficient Estimate", "zeroline": True, "zerolinecolor": "gray", "zerolinewidth": 1},
+        "xaxis": {
+            "title": "Coefficient Estimate",
+            "zeroline": True,
+            "zerolinecolor": "gray",
+            "zerolinewidth": 1,
+        },
         "yaxis": {
             "tickvals": tick_vals,
             "ticktext": tick_texts,
@@ -1250,17 +2173,26 @@ def generate_scatter_chart(data_json: str, x_var: str, y_var: str) -> str:
                 return json.dumps({"success": False, "error": "Data has no rows."})
             headers = rows[0]
             df = pd.DataFrame(rows[1:], columns=headers)
-            if "columns" in data_dict:
+            if _validate_columns_metadata(data_dict.get("columns"), df):
                 for col_info in data_dict["columns"]:
-                    if col_info.get("col_type") == "numeric" and isinstance(col_info.get("name"), str) and col_info["name"] in df.columns:
+                    if (col_info.get("col_type") == "numeric"
+                            and isinstance(col_info.get("name"), str)
+                            and col_info["name"] in df.columns):
                         df[col_info["name"]] = pd.to_numeric(df[col_info["name"]], errors="coerce")
+            else:
+                print(
+                    "[bridge] columns metadata missing or invalid, "
+                    "using dtype inference fallback",
+                    file=sys.stderr,
+                )
+                df = _infer_numeric_columns(df)
         else:
             return json.dumps({"success": False, "error": "Invalid data format."})
     except Exception as e:
         return json.dumps({"success": False, "error": f"DataFrame construction error: {e}"})
 
     if x_var not in df.columns or y_var not in df.columns:
-        return json.dumps({"success": False, "error": f"Variable not found in data."})
+        return json.dumps({"success": False, "error": "Variable not found in data."})
 
     # Drop rows with missing values in relevant columns
     df_scatter = df[[x_var, y_var]].dropna()
@@ -1293,7 +2225,7 @@ def generate_scatter_chart(data_json: str, x_var: str, y_var: str) -> str:
     y_pred_sorted = y_pred[sort_idx]
 
     # 95% CI band: se_pred = sqrt(MSE * (1/n + (x_i - x_mean)^2 / SXX))
-    SXX = float(np.sum((x - x_mean) ** 2))
+    SXX = float(np.sum((x - x_mean) ** 2))  # noqa: N806
     if SXX > 0 and mse > 0:
         try:
             from scipy import stats as scipy_stats
@@ -1374,83 +2306,55 @@ def generate_scatter_chart(data_json: str, x_var: str, y_var: str) -> str:
 # ===========================================================================
 
 
-def generate_roc_chart(data_json: str, dep_var: str) -> str:
-    """Generate an ROC curve from data by fitting a simple logit model.
+def generate_roc_chart(result_json: str) -> str:
+    """Generate an ROC curve from the already-fitted logit model predictions.
 
-    Uses the entire set of independent variables already defined in the data.
-    Returns a Plotly chart spec JSON.
+    Uses the fitted_values (predicted probabilities) and y_actual from the
+    regression result dict, so the ROC reflects the user's actual model.
 
     Args:
-        data_json: JSON string with 'data' (list of lists) and 'columns'.
-        dep_var: Name of the binary dependent variable.
+        result_json: JSON string of a logit model result (from _extract_logit_result).
 
     Returns:
         JSON with success and chart (plotly spec).
     """
     try:
-        data_dict = json.loads(data_json)
+        result = json.loads(result_json)
     except json.JSONDecodeError as e:
         return json.dumps({"success": False, "error": f"JSON parse error: {e}"})
 
-    # Reconstruct DataFrame
-    try:
-        if "data" in data_dict and isinstance(data_dict["data"], list):
-            rows = data_dict["data"]
-            if len(rows) < 2:
-                return json.dumps({"success": False, "error": "Data has no rows."})
-            headers = rows[0]
-            df = pd.DataFrame(rows[1:], columns=headers)
-            if "columns" in data_dict:
-                for col_info in data_dict["columns"]:
-                    if col_info.get("col_type") == "numeric" and isinstance(col_info.get("name"), str) and col_info["name"] in df.columns:
-                        df[col_info["name"]] = pd.to_numeric(df[col_info["name"]], errors="coerce")
-        else:
-            return json.dumps({"success": False, "error": "Invalid data format."})
-    except Exception as e:
-        return json.dumps({"success": False, "error": f"DataFrame construction error: {e}"})
+    if result.get("model_type") not in ("logit", "probit"):
+        return json.dumps({
+            "success": False,
+            "error": "ROC is only available for binary choice models (logit/probit).",
+        })
 
-    if dep_var not in df.columns:
-        return json.dumps({"success": False, "error": f"Variable '{dep_var}' not in data."})
+    y_pred_prob = np.array(result.get("fitted_values", []))
+    y_actual = np.array(result.get("y_actual", []))
 
-    # Get all numeric independent variables
-    numeric_cols = []
-    for col_info in (data_dict.get("columns") or []):
-        if col_info.get("col_type") == "numeric" and col_info["name"] != dep_var:
-            numeric_cols.append(col_info["name"])
+    if len(y_pred_prob) < 5 or len(y_actual) < 5:
+        return json.dumps({
+            "success": False,
+            "error": "Not enough valid observations for ROC (<5).",
+        })
 
-    if not numeric_cols:
-        return json.dumps({"success": False, "error": "No numeric independent variables for ROC computation."})
+    if len(y_pred_prob) != len(y_actual):
+        return json.dumps({
+            "success": False,
+            "error": "Mismatch between predictions and actual values.",
+        })
 
-    # Prepare data for ROC
-    df_roc = df[[dep_var] + numeric_cols].dropna()
-    if len(df_roc) < 5:
-        return json.dumps({"success": False, "error": "Not enough valid observations for ROC (<5)."})
-
-    y = pd.to_numeric(df_roc[dep_var], errors="coerce").values
-    y_unique = np.unique(y)
+    y_unique = np.unique(y_actual)
     if len(y_unique) != 2:
         return json.dumps({
             "success": False,
             "error": f"ROC requires binary response. Found {len(y_unique)} unique values."
         })
 
-    # Code y as 0/1
-    y_binary = (y == y_unique[1]).astype(float)
+    # Code y as 0/1 (handle non-standard binary encodings like -1/+1 or string values)
+    y_binary = (y_actual == y_unique[1]).astype(float)
 
-    # Build design matrix from numeric predictors
-    X = df_roc[numeric_cols].astype(float).values
-    X = np.column_stack([np.ones(len(y_binary)), X])  # Add intercept
-
-    # Fit logit and get predicted probabilities
-    import statsmodels.api as sm
-    try:
-        model = sm.Logit(y_binary, X)
-        fitted = model.fit(disp=False)
-        y_pred_prob = fitted.predict()
-    except Exception as e:
-        return json.dumps({"success": False, "error": f"Logit fit error for ROC: {e}"})
-
-    # Compute ROC curve
+    # Compute ROC curve from the already-fitted predicted probabilities
     thresholds = np.sort(np.unique(y_pred_prob))[::-1]
     tpr_list = []
     fpr_list = []
@@ -1582,8 +2486,11 @@ def generate_or_chart(result_json: str) -> str:
         "name": "Odds Ratio",
         "showlegend": False,
         "hovertemplate": "OR: %{x:.4f}<br>%{customdata}<extra></extra>",
-        "customdata": [f"OR={v:.4f} 95%CI [{l:.4f}, {h:.4f}] {_significance_stars(c.get('pvalue', 1))}"
-                       for v, l, h, c in zip(or_vals, or_lows, or_highs, sorted_coefs)],
+        "customdata": [
+            f"OR={v:.4f} 95%CI [{lo:.4f}, {hi:.4f}]"
+            f" {_significance_stars(c.get('pvalue', 1))}"
+            for v, lo, hi, c in zip(or_vals, or_lows, or_highs, sorted_coefs)
+        ],
     })
 
     # Reference line at OR = 1
@@ -1660,24 +2567,41 @@ def export_csv(result_json: str) -> str:
     if not coefficients:
         return json.dumps({"success": False, "error": "No coefficients to export."})
 
-    is_logit = result.get("model_type", "") == "logit"
-    stat_col = "z-value" if is_logit else "t-value"
-    or_col = ",Odds Ratio" if is_logit else ""
+    model_type = result.get("model_type", "")
+    is_logit = model_type == "logit"
+    is_probit = model_type == "probit"
+    is_count = model_type in ("poisson", "negbin")
+    is_mle = is_logit or is_probit or is_count
+    stat_col = "z-value" if is_mle else "t-value"
+    extra_col = ""
+    extra_field = ""
+    if is_logit:
+        extra_col = ",Odds Ratio"
+        extra_field = "odds_ratio"
+    elif is_count:
+        extra_col = ",IRR"
+        extra_field = "irr"
 
-    header = f"Variable,Coefficient,Std.Err.,{stat_col},p-value,CI(95%) Low,CI(95%) High{or_col},Significance"
+        extra_header = f"{extra_col},Significance"
+    header = (
+        f"Variable,Coefficient,Std.Err.,{stat_col},p-value,"
+        f"CI(95%) Low,CI(95%) High{extra_header}"
+    )
     lines = [header]
     for c in coefficients:
         stat_val = c.get("z_stat", c.get("t_stat", 0))
-        or_val = f',{c.get("odds_ratio", "")}' if is_logit else ""
+        extra_val = f',{c.get(extra_field, "")}' if extra_field else ""
         lines.append(
             f'"{c["name"]}",{c["coef"]},{c["se"]},{stat_val},'
-            f'{c["pvalue"]},{c["ci_lower"]},{c["ci_upper"]}{or_val},{c["significance"]}'
+            f'{c["pvalue"]},{c["ci_lower"]},{c["ci_upper"]}{extra_val},{c["significance"]}'
         )
 
     csv_text = "\n".join(lines)
-    if is_logit:
+    if is_mle:
+        subtype = model_type.upper()
         model_info = (
-            f"\n\n# Model Summary (Logit)\n"
+            f"\n\n# Model Summary ({subtype})\n"
+            f'# Model Type,{subtype}\n'
             f'# Pseudo R-squared,{result.get("pseudo_r_squared", "N/A")}\n'
             f'# LR chi2,{result.get("llr", "N/A")}\n'
             f'# LR p-value,{result.get("llr_pvalue", "N/A")}\n'
@@ -1690,6 +2614,7 @@ def export_csv(result_json: str) -> str:
     else:
         model_info = (
             f"\n\n# Model Summary\n"
+            f'# Model Type,{model_type.upper()}\n'
             f'# R-squared,{result.get("r_squared", "N/A")}\n'
             f'# Adj R-squared,{result.get("adj_r_squared", "N/A")}\n'
             f'# RMSE,{result.get("rmse", "N/A")}\n'
@@ -1712,9 +2637,9 @@ def export_excel(result_json: str) -> str:
     import base64
 
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.styles import Alignment, Font, PatternFill
 
         wb = Workbook()
         ws = wb.active
@@ -1753,7 +2678,8 @@ def export_excel(result_json: str) -> str:
                 ("RMSE", result.get("rmse", "")),
                 ("AIC", result.get("aic", "")),
                 ("BIC", result.get("bic", "")),
-                ("F-statistic", f'{result["f_statistic"][0] if result.get("f_statistic") else "N/A"}'),
+                ("F-statistic",
+                 f'{result["f_statistic"][0] if result.get("f_statistic") else "N/A"}'),
             ]
         for i, (label, value) in enumerate(info_items, start=3):
             ws.cell(row=i, column=1, value=label).font = Font(bold=True)
@@ -1842,7 +2768,10 @@ def get_gallery_index() -> str:
             "id": "survey_happiness",
             "title": "CGSS Resident Happiness Survey",
             "persona": "Social Science Grad Student",
-            "description": "Study income, education, health, urban/rural status, and work hours on subjective well-being.",
+            "description": (
+                "Study income, education, health, urban/rural status, "
+                "and work hours on subjective well-being."
+            ),
             "tags": ["Survey Data", "Categorical", "Multicollinearity"],
             "n_obs": 400,
             "dep_var": "happiness_score",
@@ -1851,7 +2780,10 @@ def get_gallery_index() -> str:
             "id": "trust_experiment",
             "title": "Social Trust Determinants",
             "persona": "Social Science Grad Student",
-            "description": "200-sample survey on age, income, education, media exposure, and party membership effects on trust.",
+            "description": (
+                "200-sample survey on age, income, education, "
+                "media exposure, and party membership effects on trust."
+            ),
             "tags": ["Small Sample", "Borderline Significance", "Social Survey"],
             "n_obs": 200,
             "dep_var": "trust_index",
@@ -1860,7 +2792,10 @@ def get_gallery_index() -> str:
             "id": "ecommerce_sales",
             "title": "E-commerce Sales Drivers",
             "persona": "Market Researcher",
-            "description": "500 days of e-commerce data: ad spend, price, promotions, competitor price, and season effects on sales.",
+            "description": (
+                "500 days of e-commerce data: ad spend, price, promotions, "
+                "competitor price, and season effects on sales."
+            ),
             "tags": ["Business Analytics", "High R-squared", "Multicollinearity"],
             "n_obs": 500,
             "dep_var": "sales",
@@ -1869,7 +2804,10 @@ def get_gallery_index() -> str:
             "id": "customer_satisfaction",
             "title": "Restaurant Customer Satisfaction",
             "persona": "Market Researcher",
-            "description": "350 surveys analyzing wait time, service quality, price perception, loyalty, and complaints.",
+            "description": (
+                "350 surveys analyzing wait time, service quality, "
+                "price perception, loyalty, and complaints."
+            ),
             "tags": ["Customer Analysis", "Multi-category", "Service Industry"],
             "n_obs": 350,
             "dep_var": "satisfaction_score",
@@ -1878,7 +2816,10 @@ def get_gallery_index() -> str:
             "id": "policy_effect",
             "title": "Environmental Policy Evaluation",
             "persona": "Policy Analyst",
-            "description": "300 city-level data on environmental regulation intensity, GDP, industrial structure, and emission reduction.",
+            "description": (
+                "300 city-level data on environmental regulation intensity, "
+                "GDP, industrial structure, and emission reduction."
+            ),
             "tags": ["Policy Evaluation", "Interaction Terms", "Robust SE"],
             "n_obs": 300,
             "dep_var": "emission_reduction",
